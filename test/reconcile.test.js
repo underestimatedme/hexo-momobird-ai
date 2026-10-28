@@ -384,7 +384,12 @@ test('the prune guard skips every removal and says so', async () => {
   assert.deepEqual(report.planned, { push: [], remove: [] });
   assert.equal(ops(client, 'delete').length, 0);
   assert.equal(report.removed, 0);
-  assert.ok(log.lines.some((l) => l.level === 'warn'));
+  const warns = log.lines.filter((l) => l.level === 'warn');
+  assert.equal(warns.length, 1);
+  assert.ok(warns[0].message.startsWith('[MomoBird]'), warns[0].message);
+  // `hexo generate` has no --prune flag; the warning must name the command that does.
+  assert.ok(warns[0].message.includes('hexo momobird sync --prune'), warns[0].message);
+  assert.ok(!/hexo g(enerate)?\b/.test(warns[0].message), warns[0].message);
 });
 
 test('the prune guard also holds when only 14 of 30 posts are left', async () => {
@@ -515,6 +520,113 @@ test('a post the server left out of its answer is not cached and is reported', a
   assert.equal(report.rejected[0].externalId, 'b');
   assert.equal(report.rejected[0].source, '_posts/b.md');
   assert.deepEqual(readCache(cacheFile), digestsOf(['a']));
+});
+
+function tooLarge() {
+  return new ConnectError({ kind: 'http', status: 413, code: 'PAYLOAD_TOO_LARGE' });
+}
+
+function created(posts) {
+  return { results: posts.map((p) => ({ external_id: p.external_id, status: 'created', error_code: null })) };
+}
+
+test('a 413 on a batch resends its posts one at a time; the oversized post is rejected', async () => {
+  const cacheFile = tmpCacheFile();
+  const log = fakeLog();
+  const client = fakeClient({
+    remote: ['gone'],
+    upsert: (posts, n) => {
+      if (n === 0) throw tooLarge();
+      if (posts.length === 1 && posts[0].external_id === 'b') throw tooLarge();
+      return created(posts);
+    }
+  });
+
+  const report = await runSync({ client, local: localOf(['a', 'b', 'c']), cacheFile, prune: true, dryRun: false, log });
+
+  assert.deepEqual(ops(client, 'upsert').map((c) => c.ids), [['a', 'b', 'c'], ['a'], ['b'], ['c']]);
+  assert.deepEqual(report.rejected, [{ externalId: 'b', source: '_posts/b.md', code: 'PAYLOAD_TOO_LARGE' }]);
+  assert.equal(report.pushed, 2);
+  assert.deepEqual(readCache(cacheFile), digestsOf(['a', 'c']));
+  // Nothing fatal happened, so the removal still runs.
+  assert.deepEqual(ops(client, 'delete').map((c) => c.ids), [['gone']]);
+  assert.equal(report.removed, 1);
+  // Still one progress line for the batch, with the rejection counted.
+  const progress = log.lines.filter((l) => l.message.includes('已推送'));
+  assert.equal(progress.length, 1);
+  assert.ok(progress[0].message.includes('1 篇被拒绝'), progress[0].message);
+});
+
+test('a 413 on a single-post batch is that post rejected, with no resend', async () => {
+  const cacheFile = tmpCacheFile();
+  writeCache(cacheFile, { big: 'older', ok: 'digest-ok' });
+  const client = fakeClient({
+    remote: ['ok', 'big', 'gone'],
+    upsert: (posts) => {
+      throw tooLarge();
+    }
+  });
+
+  const report = await runSync({ client, local: localOf(['big']), cacheFile, prune: true, dryRun: false, log: fakeLog() });
+
+  assert.deepEqual(ops(client, 'upsert').map((c) => c.ids), [['big']]);
+  assert.deepEqual(report.rejected, [{ externalId: 'big', source: '_posts/big.md', code: 'PAYLOAD_TOO_LARGE' }]);
+  assert.equal(report.pushed, 0);
+  assert.deepEqual(readCache(cacheFile), {});
+  assert.deepEqual(ops(client, 'delete').map((c) => c.ids), [['ok', 'gone']]);
+});
+
+test('a 413 only affects its own batch; the other batches are sent as usual', async () => {
+  const names = ids('p', 45);
+  const client = fakeClient({
+    remote: [],
+    upsert: (posts, n) => {
+      // Second call is the second batch of 20: its 413 is split, p25 stays too large.
+      if (n === 1) throw tooLarge();
+      if (posts.length === 1 && posts[0].external_id === 'p25') throw tooLarge();
+      return created(posts);
+    }
+  });
+
+  const report = await runSync({ client, local: localOf(names), cacheFile: tmpCacheFile(), prune: false, dryRun: false, log: fakeLog() });
+
+  const sizes = ops(client, 'upsert').map((c) => c.ids.length);
+  assert.deepEqual(sizes, [20, 20].concat(new Array(20).fill(1), [5]));
+  assert.deepEqual(report.rejected.map((r) => r.externalId), ['p25']);
+  assert.equal(report.pushed, 44);
+});
+
+test('a 500 during the one-at-a-time resend is still fatal: no removals, no cache', async () => {
+  const cacheFile = tmpCacheFile();
+  const client = fakeClient({
+    remote: ['a', 'b', 'c', 'gone'],
+    upsert: (posts, n) => {
+      if (n === 0) throw tooLarge();
+      if (posts[0].external_id === 'b') throw apiError(500);
+      return created(posts);
+    }
+  });
+
+  await assert.rejects(
+    runSync({ client, local: localOf(['a', 'b', 'c']), cacheFile, prune: true, dryRun: false, log: fakeLog() }),
+    (err) => err instanceof ConnectError && err.status === 500
+  );
+
+  // The batch, then a, then the failing b; c is never tried.
+  assert.deepEqual(ops(client, 'upsert').map((c) => c.ids), [['a', 'b', 'c'], ['a'], ['b']]);
+  assert.equal(ops(client, 'delete').length, 0);
+  assert.equal(fs.existsSync(cacheFile), false);
+});
+
+test('a 413 is only a rejection for http errors; other statuses and network errors stay fatal', async () => {
+  for (const error of [apiError(400), apiError(401), new ConnectError({ kind: 'network', reason: 'boom' })]) {
+    const client = fakeClient({ remote: [], upsert: () => { throw error; } });
+    await assert.rejects(
+      runSync({ client, local: localOf(['a', 'b']), cacheFile: tmpCacheFile(), prune: false, dryRun: false, log: fakeLog() }),
+      (err) => err === error
+    );
+    assert.equal(ops(client, 'upsert').length, 1);
+  }
 });
 
 test('a dry run only lists and writes no cache', async () => {
