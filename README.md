@@ -124,7 +124,7 @@ Vercel、Netlify、Cloudflare Pages 默认会给每个 PR 或分支做预览构�
 
 只在下面这些情况自动同步（问答助手和播客的输出条件相同，但与 `sync` 开关无关）：
 
-- 命令是 `hexo generate` 或 `hexo deploy` 触发的生成，包括简写 `hexo g`、`hexo gen`，以及 `hexo g -d`、`hexo d -g`。单独的 `hexo d` 不会重新生成站点，所以不会同步。
+- 命令是 `hexo generate` 或 `hexo deploy` 触发的生成，包括简写 `hexo g`、`hexo gen`，以及 `hexo g -d`、`hexo d -g`。`public/` 已存在时，单独的 `hexo d` 不会重新生成站点，所以不会同步；`hexo clean` 之后的 `hexo d` 会先生成，也会同步。
 - 不在监视模式（`hexo g --watch` 或 `-w`）：监视模式下每次保存都会重新生成，不应该每次都推送。
 - 配置里没有关掉 `sync`（`false`、`no`、`off`、`0` 都算关掉），也没有写 `momobird: false`，并且设置了 `MOMOBIRD_KEY`。
 
