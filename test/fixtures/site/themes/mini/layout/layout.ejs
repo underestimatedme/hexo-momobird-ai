@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><%= page.title ? page.title + ' - ' : '' %><%= config.title %></title>
+<link rel="canonical" href="<%= page.permalink || config.url + '/' %>">
+</head>
+<body>
+<header class="site"><a href="<%- url_for('/') %>"><%= config.title %></a></header>
+<main>
+<%- body %>
+</main>
+<footer class="site">mini theme</footer>
+</body>
+</html>

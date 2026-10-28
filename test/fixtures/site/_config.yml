@@ -1,0 +1,25 @@
+# Smallest Hexo site that exercises the plugin. scripts/integration.sh copies it
+# to a temporary directory and layers a second config on top that only points
+# `momobird.api` at the local mock server.
+title: MomoBird Hexo 测试站
+subtitle: ''
+description: ''
+author: 测试作者
+language: zh-CN
+timezone: Asia/Shanghai
+
+url: https://hexo.example.com
+root: /
+permalink: :year/:month/:day/:title/
+
+source_dir: source
+public_dir: public
+new_post_name: :title.md
+default_layout: post
+render_drafts: false
+future: true
+
+theme: mini
+
+momobird:
+  widget: true

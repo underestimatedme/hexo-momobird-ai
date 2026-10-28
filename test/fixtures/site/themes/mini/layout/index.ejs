@@ -1,0 +1,8 @@
+<ul class="entries">
+<% page.posts.each(function (post) { %>
+  <li class="entry">
+    <a class="entry-title" href="<%- url_for(post.path) %>"><%= post.title %></a>
+    <div class="entry-excerpt"><%- post.excerpt || post.content %></div>
+  </li>
+<% }); %>
+</ul>

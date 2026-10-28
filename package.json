@@ -14,7 +14,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "test:integration": "bash scripts/integration.sh"
   },
   "dependencies": {}
 }

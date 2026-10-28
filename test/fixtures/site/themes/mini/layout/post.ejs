@@ -1,0 +1,5 @@
+<article class="post" data-title="<%= page.title %>" data-permalink="<%= page.permalink %>" data-date="<%= date(page.date, 'YYYY-MM-DD HH:mm:ss') %>">
+  <h1 class="post-title"><%= page.title %></h1>
+  <p class="post-meta">发布于 <time datetime="<%= date(page.date, 'YYYY-MM-DDTHH:mm:ssZ') %>"><%= date(page.date, 'YYYY-MM-DD') %></time>，原文 <a class="post-permalink" href="<%= page.permalink %>"><%= page.permalink %></a></p>
+  <div class="post-content"><%- page.content %></div>
+</article>
