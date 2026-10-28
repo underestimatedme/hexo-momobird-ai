@@ -4,8 +4,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const util = require('node:util');
+const { EventEmitter } = require('node:events');
 
-const { createClient, ConnectError, describeError } = require('../lib/client');
+const { createClient, createTransport, ConnectError, describeError } = require('../lib/client');
 
 const KEY = 'mbk_live_0123456789abcdefSECRET';
 const API = 'https://api.example.test';
@@ -645,4 +646,123 @@ test('the default transport does not follow a redirect with the key', async () =
       );
     }
   );
+});
+
+// ------------------------------------- default transport, Node 14 event order
+
+// A stand-in for the `http`/`https` modules. Each request answers with the
+// next step; a step receives the fake response right after the transport has
+// attached its listeners, and emits whatever events it wants.
+function fakeModules(steps) {
+  const requests = [];
+  const impl = {
+    request(target, options, onResponse) {
+      const req = new EventEmitter();
+      req.write = () => true;
+      req.destroy = () => {};
+      req.end = () => {
+        const step = steps[Math.min(requests.length - 1, steps.length - 1)];
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        res.complete = false;
+        setImmediate(() => {
+          onResponse(res);
+          step(res);
+        });
+      };
+      requests.push({ target, options });
+      return req;
+    }
+  };
+  return { http: impl, https: impl, requests };
+}
+
+// Node 14 on a connection that drops mid-body: `aborted`, then `end` (which
+// emits `close` from inside), with `complete` still false and no `error`.
+function truncatedNode14(res) {
+  res.emit('data', Buffer.from('{"code":"OK","data":'));
+  res.emit('aborted');
+  res.emit('end');
+  res.emit('close');
+}
+
+function completeAnswer(data) {
+  return (res) => {
+    res.complete = true;
+    res.emit('data', Buffer.from(envelope(data)));
+    res.emit('end');
+    res.emit('close');
+  };
+}
+
+function clientOver(modules, extra) {
+  const sleeps = [];
+  const client = createClient(
+    Object.assign(
+      {
+        api: 'http://127.0.0.1:1',
+        key: KEY,
+        transport: createTransport(30000, modules),
+        sleep: (ms) => {
+          sleeps.push(ms);
+          return Promise.resolve();
+        }
+      },
+      extra
+    )
+  );
+  return { client, sleeps };
+}
+
+test('a response cut off mid-body (Node 14 event order) is a network error, not a 200', async () => {
+  const modules = fakeModules([truncatedNode14]);
+  const { client } = clientOver(modules, { retryDelaysMs: [] });
+  const err = await caught(client.status());
+
+  assert.ok(err instanceof ConnectError);
+  assert.equal(err.kind, 'network');
+  assert.equal(err.status, undefined);
+  assert.equal(err.message, '连不上 MomoBird：连接在响应过程中中断');
+  assert.equal(modules.requests.length, 1);
+  assertNoKey(err);
+});
+
+test('a response cut off mid-body is retried and the next attempt can succeed', async () => {
+  const modules = fakeModules([truncatedNode14, truncatedNode14, completeAnswer({ recovered: true })]);
+  const { client, sleeps } = clientOver(modules);
+
+  assert.deepEqual(await client.status(), { recovered: true });
+  assert.equal(modules.requests.length, 3);
+  assert.deepEqual(sleeps, [1000, 3000]);
+});
+
+test('a response cut off on every attempt ends as a network error after 3 attempts', async () => {
+  const modules = fakeModules([truncatedNode14]);
+  const { client, sleeps } = clientOver(modules);
+  const err = await caught(client.status());
+
+  assert.equal(err.kind, 'network');
+  assert.equal(modules.requests.length, 3);
+  assert.deepEqual(sleeps, [1000, 3000]);
+});
+
+test('a complete response through the same stand-in is accepted', async () => {
+  const modules = fakeModules([completeAnswer({ fine: true })]);
+  const { client } = clientOver(modules, { retryDelaysMs: [] });
+  assert.deepEqual(await client.status(), { fine: true });
+  assert.equal(modules.requests.length, 1);
+});
+
+test('a response that closes without ever ending is a network error too', async () => {
+  const modules = fakeModules([
+    (res) => {
+      res.emit('data', Buffer.from('{"code":"OK"'));
+      res.emit('aborted');
+      res.emit('close');
+    }
+  ]);
+  const { client } = clientOver(modules, { retryDelaysMs: [] });
+  const err = await caught(client.status());
+  assert.equal(err.kind, 'network');
+  assert.equal(err.message, '连不上 MomoBird：连接在响应过程中中断');
 });
