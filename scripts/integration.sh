@@ -436,7 +436,7 @@ categories:
 
 这篇文章有三个顶层分类，front-matter 里最先写的是 Zeta。
 EOF
-  local probe_id sent probe_rows nested_rows
+  local probe_id sent probe_rows nested_rows fresh_rows
   probe_id="$(h external-id _posts/multi-root-probe.md)"
   mark="$(lines_of "$M1_LOG")"
   hexo_run gen6 key generate
@@ -445,17 +445,41 @@ EOF
   nested_rows="$(h hexo-categories "$SITE" 2>/dev/null | awk -F'\t' '$1 == "_posts/categories-nested.md"')"
   record C "category order (two-level post)" INFO \
     "front-matter: 技术 > Hexo; post.categories order: $(echo "$nested_rows" | cut -f2) (join table: $(echo "$nested_rows" | cut -f3); '^' marks a child); plugin sent: $(echo "$pushed" | awk -F'\t' -v id="$nested_id" '$1 == id {print $3}')"
-  # A fresh load (no db.json) creates the categories in file-processing order.
+
+  # post.categories is in site-wide creation order (技术 was created by another
+  # post first); the post's own PostCategory rows keep the front-matter order.
+  # The plugin has to send the front-matter-first top-level category: Zeta.
+  verdict C "a post with three top-level categories is sent with the front-matter-first one" \
+    "front-matter roots in order: Zeta, Alpha, 技术; post.categories order: $(echo "$probe_rows" | cut -f2); PostCategory order: $(echo "$probe_rows" | cut -f3); plugin sent: $sent" \
+    eq "$sent" "Zeta"
+
+  # A fresh load (no db.json) creates the categories in file-processing order,
+  # which is not the same on every Hexo version (Hexo 8 puts Zeta before 技术).
   hexo_run clean3 none clean
-  local fresh_rows
   fresh_rows="$(h hexo-categories "$SITE" 2>/dev/null | awk -F'\t' '$1 == "_posts/multi-root-probe.md"')"
-  if [ "$sent" = "Zeta" ]; then
-    record C "category order (three top-level categories)" INFO \
-      "front-matter roots in order: Zeta, Alpha, 技术; post.categories order: $(echo "$probe_rows" | cut -f2); join table: $(echo "$probe_rows" | cut -f3); after hexo clean: $(echo "$fresh_rows" | cut -f2) / join $(echo "$fresh_rows" | cut -f3); plugin sent: $sent (equals the first root in front-matter)"
-  else
-    record C "category order (three top-level categories)" DIFF \
-      "front-matter roots in order: Zeta, Alpha, 技术; post.categories order: $(echo "$probe_rows" | cut -f2); join table: $(echo "$probe_rows" | cut -f3); after hexo clean: $(echo "$fresh_rows" | cut -f2) / join $(echo "$fresh_rows" | cut -f3); plugin sent: $sent (NOT the first root in front-matter)"
-  fi
+  record C "category order after a fresh load (information)" INFO \
+    "post.categories order: $(echo "$fresh_rows" | cut -f2); PostCategory order: $(echo "$fresh_rows" | cut -f3)"
+
+  # hexo clean && hexo g, plugin cache kept: the digest must be the same as
+  # before the clean, so nothing is pushed again.
+  hexo_run clean4 none clean
+  mark="$(lines_of "$M1_LOG")"
+  hexo_run gen7 key generate
+  verdict C "after hexo clean && hexo g the category is unchanged: nothing is pushed again" \
+    "exit $RC; $(requests_line "$M1_LOG" "$mark")" \
+    eq "$RC:$(count_requests "$M1_LOG" "$mark" '^PUT /posts')" "0:0"
+
+  # hexo clean && hexo g, plugin cache wiped: everything is pushed again and
+  # the probe still carries Zeta.
+  hexo_run clean5 none clean
+  rm -rf "$SITE/node_modules/.cache"
+  mark="$(lines_of "$M1_LOG")"
+  hexo_run gen8 key generate
+  local sent_again
+  sent_again="$(tail -n +"$((mark + 1))" "$M1_LOG" | h pushed | awk -F'\t' -v id="$probe_id" '$1 == id {print $3}')"
+  verdict C "after hexo clean && hexo g (no cache) the three-category post is still sent with Zeta" \
+    "exit $RC; plugin sent: ${sent_again:-(nothing)}; $(requests_line "$M1_LOG" "$mark")" \
+    eq "$RC:$sent_again" "0:Zeta"
 
   # --- 9: strict mode with a failing PUT ----------------------------------------------
   start_mock M2 "$SITE_URL" --put-status 500

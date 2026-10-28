@@ -315,6 +315,79 @@ test('mapPost digest ignores changes to updated only', () => {
   assert.equal(before.digest, after.digest);
 });
 
+// ------------------------------------------------------------ categoriesOf
+
+// Hexo's post.categories is in site-wide creation order; the caller can pass
+// the post's own order (front-matter order) with opts.categoriesOf.
+const TECH = { _id: 't', name: '技术' };
+const ZETA = { _id: 'z', name: 'Zeta' };
+const INNER = { _id: 'i', name: 'Inner', parent: 'z' };
+const ALPHA = { _id: 'a', name: 'Alpha' };
+const SITE_ORDER = [TECH, ZETA, INNER, ALPHA];
+const FRONT_MATTER_ORDER = [ZETA, INNER, ALPHA, TECH];
+
+test('mapPost takes the category from opts.categoriesOf, so the front-matter-first top-level one wins', () => {
+  const post = makePost({ categories: SITE_ORDER });
+  assert.equal(mapPost(post).payload.category, '技术');
+
+  const seen = [];
+  const mapped = mapPost(post, {
+    categoriesOf(candidate) {
+      seen.push(candidate);
+      return FRONT_MATTER_ORDER;
+    }
+  });
+
+  assert.equal(mapped.payload.category, 'Zeta');
+  assert.deepEqual(seen, [post]);
+});
+
+test('mapPost still prefers a parentless category when categoriesOf lists a child first', () => {
+  const post = makePost({ categories: SITE_ORDER });
+  const mapped = mapPost(post, { categoriesOf: () => [INNER, ZETA, TECH] });
+  assert.equal(mapped.payload.category, 'Zeta');
+});
+
+test('mapPost sends no category when categoriesOf returns none, whatever post.categories holds', () => {
+  const post = makePost({ categories: SITE_ORDER });
+  const mapped = mapPost(post, { categoriesOf: () => [] });
+  assert.equal(Object.prototype.hasOwnProperty.call(mapped.payload, 'category'), false);
+});
+
+test('the digest follows the category categoriesOf chose', () => {
+  const post = makePost({ categories: SITE_ORDER });
+  const siteWide = mapPost(post);
+  const frontMatter = mapPost(post, { categoriesOf: () => FRONT_MATTER_ORDER });
+  const again = mapPost(post, { categoriesOf: () => FRONT_MATTER_ORDER.slice() });
+
+  assert.notEqual(frontMatter.digest, siteWide.digest);
+  assert.equal(again.digest, frontMatter.digest);
+});
+
+test('collectLocal hands every syncable post to opts.categoriesOf', () => {
+  const first = makePost({ categories: SITE_ORDER });
+  const second = makePost({ source: '_posts/second.md', title: 'Second', slug: 'second', categories: [TECH] });
+  const draft = makePost({ source: '_posts/draft.md', published: false });
+  const seen = [];
+
+  const { items } = collectLocal(
+    [first, second, draft],
+    Object.assign(
+      {
+        categoriesOf(post) {
+          seen.push(post.source);
+          return post === first ? FRONT_MATTER_ORDER : [];
+        }
+      },
+      opts
+    )
+  );
+
+  assert.deepEqual(seen, ['_posts/hello-world.md', '_posts/second.md']);
+  assert.equal(items.get(externalId('_posts/hello-world.md')).payload.category, 'Zeta');
+  assert.equal(Object.prototype.hasOwnProperty.call(items.get(externalId('_posts/second.md')).payload, 'category'), false);
+});
+
 // -------------------------------------------------------------- collectLocal
 
 test('collectLocal keeps only syncable posts and keys them by external id', () => {

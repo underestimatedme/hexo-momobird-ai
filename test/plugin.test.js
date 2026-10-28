@@ -38,6 +38,7 @@ function tmpDir() {
 function makePost(name, overrides) {
   return Object.assign(
     {
+      _id: 'id-' + name,
       title: 'Post ' + name,
       slug: name,
       source: '_posts/' + name + '.md',
@@ -138,6 +139,8 @@ function makeHexo(opts) {
   const loads = [];
   const queries = [];
   const posts = o.posts || [makePost('a'), makePost('b')];
+  const joinQueries = [];
+  const joinsOf = (post) => (o.joins && o.joins[post._id]) || post.categories || [];
 
   const hexo = {
     version: o.version || '8.1.2',
@@ -167,21 +170,49 @@ function makeHexo(opts) {
         }
       }
     },
+    // Post, PostCategory and Category, as far as the plugin reads them.
+    // post.categories is Hexo's site-wide order; the PostCategory rows of a
+    // post come from `joins[post._id]` (front-matter order) when the test gives
+    // them, else from post.categories.
     model(name) {
-      assert.equal(name, 'Post');
-      return {
-        find(query) {
-          queries.push(query);
-          return { toArray: () => posts.slice() };
-        }
-      };
+      if (name === 'Post') {
+        return {
+          find(query) {
+            queries.push(query);
+            return { toArray: () => posts.slice() };
+          }
+        };
+      }
+      if (name === 'PostCategory') {
+        return {
+          find(query) {
+            joinQueries.push(query);
+            const post = posts.find((candidate) => candidate._id === query.post_id);
+            const docs = !post ? [] : joinsOf(post);
+            return { toArray: () => docs.map((doc) => ({ post_id: post._id, category_id: doc._id })) };
+          }
+        };
+      }
+      if (name === 'Category') {
+        return {
+          findById(id) {
+            for (const post of posts) {
+              for (const doc of joinsOf(post).concat(post.categories || [])) {
+                if (doc._id === id && !doc.missing) return doc;
+              }
+            }
+            return undefined;
+          }
+        };
+      }
+      return assert.fail('the plugin asked for the unexpected model ' + name);
     },
     load() {
       loads.push(true);
       return Promise.resolve();
     }
   };
-  return { hexo, logs, filters, injected, commands, loads, queries };
+  return { hexo, logs, filters, injected, commands, loads, queries, joinQueries };
 }
 
 // Registers the plugin on a fake Hexo with a fake client, and returns helpers
@@ -1198,6 +1229,83 @@ test('by default a failing command sets process.exitCode to 1', async () => {
   } finally {
     process.exitCode = before;
   }
+});
+
+// ---------------------------------------------------------------------------
+// Category order
+
+// post.categories comes back in the order the categories were created on the
+// site, which is neither the post's front-matter order nor stable between
+// builds. The post's own PostCategory rows keep the front-matter order.
+function multiRootPost() {
+  const tech = { _id: 'c-tech', name: '技术' };
+  const zeta = { _id: 'c-zeta', name: 'Zeta' };
+  const inner = { _id: 'c-inner', name: 'Inner', parent: 'c-zeta' };
+  const alpha = { _id: 'c-alpha', name: 'Alpha' };
+  return {
+    post: makePost('multi', { categories: [tech, zeta, inner, alpha] }),
+    frontMatter: [zeta, inner, alpha, tech]
+  };
+}
+
+test('a build sends the first top-level category in front-matter order, read from the PostCategory rows', async () => {
+  const { post, frontMatter } = multiRootPost();
+  const t = setup({ posts: [post], joins: { [post._id]: frontMatter } });
+
+  await t.build();
+
+  assert.equal(t.client.upserted.length, 1);
+  assert.equal(t.client.upserted[0].category, 'Zeta');
+  assert.deepEqual(t.joinQueries, [{ post_id: post._id }]);
+});
+
+test('the category does not change when only the site-wide order of post.categories changes', async () => {
+  const { post, frontMatter } = multiRootPost();
+  const reordered = Object.assign({}, post, { categories: post.categories.slice().reverse() });
+
+  const first = setup({ posts: [post], joins: { [post._id]: frontMatter } });
+  const second = setup({ posts: [reordered], joins: { [post._id]: frontMatter } });
+  await first.build();
+  await second.build();
+
+  assert.equal(first.client.upserted[0].category, 'Zeta');
+  assert.deepEqual(second.client.upserted, first.client.upserted);
+});
+
+test('hexo momobird sync sends the PostCategory order too', async () => {
+  const { post, frontMatter } = multiRootPost();
+  const t = setup({
+    cmd: 'momobird',
+    args: { _: ['momobird', 'sync'] },
+    posts: [post],
+    joins: { [post._id]: frontMatter }
+  });
+
+  await t.command({ _: ['sync'] });
+
+  assert.equal(t.client.upserted.length, 1);
+  assert.equal(t.client.upserted[0].category, 'Zeta');
+  assert.deepEqual(t.exitCodes, []);
+});
+
+test('a post whose PostCategory rows are empty is sent without a category', async () => {
+  const { post } = multiRootPost();
+  const t = setup({ posts: [post], joins: { [post._id]: [] } });
+
+  await t.build();
+
+  assert.equal(t.client.upserted.length, 1);
+  assert.equal(Object.prototype.hasOwnProperty.call(t.client.upserted[0], 'category'), false);
+});
+
+test('a PostCategory row whose category no longer exists is skipped', async () => {
+  const { post, frontMatter } = multiRootPost();
+  const ghost = { _id: 'c-ghost', name: 'Ghost', missing: true };
+  const t = setup({ posts: [post], joins: { [post._id]: [ghost].concat(frontMatter) } });
+
+  await t.build();
+
+  assert.equal(t.client.upserted[0].category, 'Zeta');
 });
 
 // ---------------------------------------------------------------------------

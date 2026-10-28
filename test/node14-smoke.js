@@ -100,6 +100,12 @@ function fixedValues() {
   assert.ok(command.autoRunEnabled({ cmd: 'generate', args: {}, aliases: {} }));
   assert.ok(!command.autoRunEnabled({ cmd: 'generate', args: { w: true }, aliases: {} }));
   step('config, command, frontend');
+
+  const withHook = posts.mapPost(fakePost('_posts/c.md', 'C', '<p>x</p>', [{ name: '技术' }]), {
+    categoriesOf: () => [{ name: 'Zeta' }, { name: 'Inner', parent: 'z' }, { name: '技术' }]
+  });
+  assert.strictEqual(withHook.payload.category, 'Zeta');
+  step('mapPost with categoriesOf');
 }
 
 function registersIntoHexo() {
