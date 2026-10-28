@@ -14,10 +14,11 @@
 //   log-lint <file...>                every line with Chinese text must carry [MomoBird]; no U+FFFD
 //   hexo-categories <site-dir>        load the site with its own Hexo; print each post's categories:
 //                                     source<TAB>post.categories order<TAB>join-table order
-//   run (--stop-after S | --limit S) -- <cmd> [args...]
+//   run [--cwd DIR] (--stop-after S | --limit S) -- <cmd> [args...]
 //                                     run a command in its own process group; --stop-after ends it
 //                                     after S seconds and exits 0, --limit exits 124 if it is still
-//                                     running after S seconds
+//                                     running after S seconds. SIGINT, SIGTERM and SIGHUP sent to the
+//                                     helper are passed on to the group (then it exits 128+signal).
 
 const fs = require('fs');
 const net = require('net');
@@ -137,18 +138,33 @@ async function hexoCategories(site) {
   await hexo.exit();
 }
 
-function run(args) {
-  const mode = args[0];
-  const seconds = Number(args[1]);
-  const sep = args.indexOf('--');
-  if ((mode !== '--stop-after' && mode !== '--limit') || !(seconds > 0) || sep < 0 || sep === args.length - 1) {
-    process.stderr.write('usage: run (--stop-after S | --limit S) -- cmd [args...]\n');
+function run(argv) {
+  const sep = argv.indexOf('--');
+  const options = sep < 0 ? argv : argv.slice(0, sep);
+  const cmd = sep < 0 ? [] : argv.slice(sep + 1);
+
+  let mode = null;
+  let seconds = 0;
+  let cwd;
+  for (let i = 0; i < options.length; i += 2) {
+    if (options[i] === '--stop-after' || options[i] === '--limit') {
+      mode = options[i];
+      seconds = Number(options[i + 1]);
+    } else if (options[i] === '--cwd') {
+      cwd = options[i + 1];
+    } else {
+      mode = null;
+    }
+  }
+  if (mode === null || !(seconds > 0) || cmd.length === 0) {
+    process.stderr.write('usage: run [--cwd DIR] (--stop-after S | --limit S) -- cmd [args...]\n');
     process.exit(2);
   }
-  const cmd = args.slice(sep + 1);
-  const child = spawn(cmd[0], cmd.slice(1), { stdio: 'inherit', detached: true });
+
+  const child = spawn(cmd[0], cmd.slice(1), { stdio: 'inherit', detached: true, cwd });
 
   let timedOut = false;
+  let interrupted = null;
   const killGroup = (signal) => {
     try {
       process.kill(-child.pid, signal);
@@ -163,6 +179,19 @@ function run(args) {
     setTimeout(() => killGroup('SIGKILL'), 3000).unref();
   }, seconds * 1000);
 
+  // The child has its own process group, so a Ctrl-C or a kill aimed at this
+  // helper (or at the script that started it) never reaches it by itself.
+  // Pass the signal on, and make sure the group is gone a moment later.
+  ['SIGINT', 'SIGTERM', 'SIGHUP'].forEach((signal) => {
+    process.on(signal, () => {
+      if (interrupted !== null) return;
+      interrupted = signal;
+      process.stderr.write('[run] ' + signal + ' received, stopping ' + cmd[0] + '\n');
+      killGroup('SIGTERM');
+      setTimeout(() => killGroup('SIGKILL'), 3000).unref();
+    });
+  });
+
   child.on('error', (err) => {
     process.stderr.write('[run] cannot start ' + cmd[0] + ': ' + err.message + '\n');
     process.exit(127);
@@ -170,6 +199,7 @@ function run(args) {
   child.on('exit', (code, signal) => {
     clearTimeout(timer);
     killGroup('SIGKILL');
+    if (interrupted !== null) process.exit(128 + (require('os').constants.signals[interrupted] || 0));
     if (timedOut) process.exit(mode === '--stop-after' ? 0 : 124);
     process.exit(code === null ? 128 + (require('os').constants.signals[signal] || 0) : code);
   });

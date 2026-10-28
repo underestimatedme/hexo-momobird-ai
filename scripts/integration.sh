@@ -31,6 +31,8 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/hexo-momobird-it.XXXXXX")"
 RESULTS="$WORK/results.tsv"
 : > "$RESULTS"
 MOCK_PIDS=""
+HELPER_PIDS=""
+HELPER_ENV=""
 
 stop_mocks() {
   local pid
@@ -40,7 +42,23 @@ stop_mocks() {
   MOCK_PIDS=""
 }
 
+# The helpers (scripts/integration-helpers.js run) keep hexo in a process group
+# of its own, so an interrupted script has to stop them itself: a TERM makes a
+# helper take its hexo process group down and exit.
+stop_helpers() {
+  local pid
+  for pid in $HELPER_PIDS; do
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  for pid in $HELPER_PIDS; do
+    wait "$pid" 2>/dev/null || true
+  done
+  HELPER_PIDS=""
+}
+
 cleanup() {
+  trap - EXIT
+  stop_helpers
   stop_mocks
   if [ "${KEEP_WORK:-}" = 1 ]; then
     echo "kept $WORK"
@@ -49,6 +67,11 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+# Without these, bash would only act on a signal once the command it is
+# waiting for has finished.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 die() {
   echo "integration: $*" >&2
@@ -129,6 +152,24 @@ occurrences() {
 
 # ----- running Hexo ------------------------------------------------------------
 
+# helper_run LOGFILE helper-args...   (environment: HELPER_ENV, as env arguments)   Runs `integration-helpers.js run` in the
+# background and waits for it, so that a signal sent to this script is handled
+# at once and the helper is stopped by the trap. Output goes to LOGFILE, the
+# exit status to RC.
+helper_run() {
+  local log=$1 pid
+  shift
+  # The key goes into the helper's environment (which the hexo process then
+  # inherits), not onto a command line where `ps` would show it.
+  # shellcheck disable=SC2086
+  env $HELPER_ENV node "$HELPERS" run "$@" < /dev/null > "$log" 2>&1 &
+  pid=$!
+  HELPER_PIDS="$HELPER_PIDS $pid"
+  RC=0
+  wait "$pid" || RC=$?
+  HELPER_PIDS="${HELPER_PIDS/ $pid/}"
+}
+
 # hexo_run LABEL KEYMODE hexo-args...   KEYMODE: key | none | bad
 # Output goes to $OUT/LABEL.log, the exit status to RC.
 hexo_run() {
@@ -140,18 +181,16 @@ hexo_run() {
     none) keyenv="-u MOMOBIRD_KEY" ;;
     *) die "bad key mode $mode" ;;
   esac
-  RC=0
-  # shellcheck disable=SC2086
-  (cd "$SITE" && node "$HELPERS" run --limit 180 -- env $keyenv "$HEXO" "$@" --config "$CFG") \
-    < /dev/null > "$OUT/$label.log" 2>&1 || RC=$?
+  HELPER_ENV="$keyenv"
+  helper_run "$OUT/$label.log" --cwd "$SITE" --limit 180 -- "$HEXO" "$@" --config "$CFG"
 }
 
 # hexo_for SECONDS LABEL hexo-args...   (with the key) for commands that never end on their own.
 hexo_for() {
   local seconds=$1 label=$2
   shift 2
-  (cd "$SITE" && node "$HELPERS" run --stop-after "$seconds" -- env "MOMOBIRD_KEY=$KEY" "$HEXO" "$@" --config "$CFG") \
-    < /dev/null > "$OUT/$label.log" 2>&1
+  HELPER_ENV="MOMOBIRD_KEY=$KEY"
+  helper_run "$OUT/$label.log" --cwd "$SITE" --stop-after "$seconds" -- "$HEXO" "$@" --config "$CFG"
 }
 
 # ----- verdicts ----------------------------------------------------------------
@@ -181,6 +220,34 @@ hasnt() { ! grep -q -F -- "$2" "$1"; }
 
 page() {
   echo "$SITE/public/$1/index.html"
+}
+
+# ----- key scans ---------------------------------------------------------------
+
+# Files under the given paths that hold the key, a fragment of it or anything
+# starting like a key.
+key_hits() {
+  grep -rlF -e "$KEY" -e mbk_ -e HEXOLOCALTESTKEY -e WRONGKEY "$@" 2>/dev/null || true
+}
+
+# public_leak_scan LABEL
+# Scans public/ for the key while it holds plugin output. The scan only means
+# something if there is plugin output to scan, so it first asserts that every
+# page carries the widget tag (data-project=) and that placeholders
+# (momobird-podcast) exist. The builds that follow later (origin mismatch, wrong
+# key) emit none of that.
+public_leak_scan() {
+  local label=$1 pages widgets placeholders hits
+  pages="$(find "$SITE/public" -name '*.html' | wc -l | tr -d ' ')"
+  widgets="$(grep -rlF 'data-project=' "$SITE/public" 2>/dev/null | wc -l | tr -d ' ' || true)"
+  placeholders="$(grep -rlF 'momobird-podcast' "$SITE/public" 2>/dev/null | wc -l | tr -d ' ' || true)"
+  verdict B9 "$label: public/ holds plugin output before it is scanned" \
+    "html pages=$pages, pages with data-project=$widgets, pages with momobird-podcast=$placeholders" \
+    test "$pages" -gt 0 -a "$widgets" -eq "$pages" -a "$placeholders" -gt 0
+  hits="$(key_hits "$SITE/public")"
+  verdict B9 "$label: no key, not even the mbk_ prefix, in public/" \
+    "scanned $pages pages and $(find "$SITE/public" -type f | wc -l | tr -d ' ') files; files with a match: ${hits:-none}" \
+    test -z "$hits"
 }
 
 # ----- one Hexo version --------------------------------------------------------
@@ -263,6 +330,17 @@ EOF
   gen1_requests="$(requests_line "$M1_LOG" "$mark")"
   verdict 1 "hexo g syncs" "exit $RC; $gen1_requests" \
     eq "$RC:$(count_requests "$M1_LOG" "$mark" '^PUT /posts')" "0:1"
+
+  public_leak_scan "after gen1 (first sync)"
+  # The scan has to find a key where there is one: a copy of a plugin page with
+  # the key appended, kept in a scratch directory outside public/.
+  mkdir -p "$VDIR/scan-selftest/planted" "$VDIR/scan-selftest/clean"
+  cp "$(page 2026/10/20/hello-world)" "$VDIR/scan-selftest/clean/index.html"
+  cp "$(page 2026/10/20/hello-world)" "$VDIR/scan-selftest/planted/index.html"
+  printf '<!-- %s -->\n' "$KEY" >> "$VDIR/scan-selftest/planted/index.html"
+  verdict B9 "scan self-test: a plugin page with the key appended is flagged, the untouched copy is not" \
+    "planted copy flagged: $(key_hits "$VDIR/scan-selftest/planted" | wc -l | tr -d ' ') file; untouched copy flagged: $(key_hits "$VDIR/scan-selftest/clean" | wc -l | tr -d ' ') files" \
+    eq "$(key_hits "$VDIR/scan-selftest/planted" | wc -l | tr -d ' '):$(key_hits "$VDIR/scan-selftest/clean" | wc -l | tr -d ' ')" "1:0"
 
   local pushed
   pushed="$(tail -n +"$((mark + 1))" "$M1_LOG" | h pushed)"
@@ -392,9 +470,10 @@ EOF
   local port spid i
   port="$(h free-port)"
   mark="$(lines_of "$M1_LOG")"
-  (cd "$SITE" && node "$HELPERS" run --stop-after 8 -- env "MOMOBIRD_KEY=$KEY" "$HEXO" s -p "$port" -i 127.0.0.1 --config "$CFG") \
+  env "MOMOBIRD_KEY=$KEY" node "$HELPERS" run --cwd "$SITE" --stop-after 8 -- "$HEXO" s -p "$port" -i 127.0.0.1 --config "$CFG" \
     < /dev/null > "$OUT/server.log" 2>&1 &
   spid=$!
+  HELPER_PIDS="$HELPER_PIDS $spid"
   i=0
   until curl -sf -m 2 -o "$OUT/server-home.html" "http://127.0.0.1:$port/"; do
     i=$((i + 1))
@@ -403,6 +482,7 @@ EOF
   done
   curl -sf -m 5 -o "$OUT/server-post.html" "http://127.0.0.1:$port/2026/10/22/categories-nested/" || true
   wait "$spid" || true
+  HELPER_PIDS="${HELPER_PIDS/ $spid/}"
   [ -f "$OUT/server-home.html" ] || : > "$OUT/server-home.html"
   [ -f "$OUT/server-post.html" ] || : > "$OUT/server-post.html"
   local served_home served_post
@@ -480,6 +560,7 @@ EOF
   verdict C "after hexo clean && hexo g (no cache) the three-category post is still sent with Zeta" \
     "exit $RC; plugin sent: ${sent_again:-(nothing)}; $(requests_line "$M1_LOG" "$mark")" \
     eq "$RC:$sent_again" "0:Zeta"
+  public_leak_scan "after gen8 (hexo clean && hexo g)"
 
   # --- 9: strict mode with a failing PUT ----------------------------------------------
   start_mock M2 "$SITE_URL" --put-status 500
@@ -535,10 +616,9 @@ EOF
     "$(echo "$lint" | tail -1)" \
     h log-lint $(ls "$OUT"/*.log | grep -v npm-install)
   local leaked
-  leaked="$(grep -rlF -e "$KEY" -e mbk_ -e HEXOLOCALTESTKEY -e WRONGKEY "$OUT" "$SITE/public" "$SITE/db.json" "$SITE/_multiconfig.yml" \
-    "$SITE/node_modules/.cache" "$VDIR"/*.jsonl "$VDIR"/*.out 2>/dev/null || true)"
-  verdict B9 "no key (not even the mbk_ prefix) in any stdout/stderr, public/, db.json, the cache or the mock log" \
-    "scanned $(ls "$OUT"/*.log | wc -l | tr -d ' ') command logs, $(find "$SITE/public" -type f | wc -l | tr -d ' ') public files; files with a match: ${leaked:-none}" \
+  leaked="$(key_hits "$OUT" "$SITE/db.json" "$SITE/_multiconfig.yml" "$SITE/node_modules/.cache" "$VDIR"/*.jsonl "$VDIR"/*.out)"
+  verdict B9 "no key (not even the mbk_ prefix) in any stdout/stderr, db.json, the cache or the mock logs" \
+    "scanned $(ls "$OUT"/*.log | wc -l | tr -d ' ') command logs; files with a match: ${leaked:-none}" \
     test -z "$leaked"
 
   record N "Node warnings in Hexo's output" INFO \
