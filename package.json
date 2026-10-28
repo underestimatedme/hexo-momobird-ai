@@ -15,7 +15,8 @@
   ],
   "scripts": {
     "test": "node --test",
-    "test:integration": "bash scripts/integration.sh"
+    "test:integration": "bash scripts/integration.sh",
+    "package": "bash scripts/package.sh"
   },
   "dependencies": {}
 }
