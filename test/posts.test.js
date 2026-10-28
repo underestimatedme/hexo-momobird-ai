@@ -77,6 +77,52 @@ test('isSyncable keeps posts whose flags are present but not set', () => {
   assert.equal(isSyncable(makePost({ momobird: undefined }), opts), true);
 });
 
+// Hexo reads front-matter with js-yaml, so an author's "yes", 1 or "true" arrives
+// as a string or a number. Hidden, opted-out and encrypted posts must never
+// reach MomoBird, so these checks fail closed.
+
+test('isSyncable skips hidden posts whatever way hide or hidden is written', () => {
+  const hiding = [true, 1, 2, 'yes', 'Yes', 'YES', 'true', 'True', ' true ', 'on', 'ON', 'anything', '0', 'n', NaN, [], {}];
+  for (const key of ['hide', 'hidden']) {
+    for (const value of hiding) {
+      assert.equal(isSyncable(makePost({ [key]: value }), opts), false, key + ': ' + JSON.stringify(value));
+    }
+  }
+});
+
+test('isSyncable keeps posts whose hide or hidden is clearly off', () => {
+  const visible = [undefined, null, false, '', 0, -0, 'false', 'False', 'FALSE', ' false ', 'no', 'No', 'NO', 'off', 'Off', ' OFF '];
+  for (const key of ['hide', 'hidden']) {
+    for (const value of visible) {
+      assert.equal(isSyncable(makePost({ [key]: value }), opts), true, key + ': ' + JSON.stringify(value));
+    }
+  }
+});
+
+test('isSyncable skips posts that opt out with momobird in any falsy spelling', () => {
+  const optedOut = [false, 0, -0, 'false', 'False', 'FALSE', ' false ', 'no', 'No', 'NO', 'off', 'Off', ' OFF '];
+  for (const value of optedOut) {
+    assert.equal(isSyncable(makePost({ momobird: value }), opts), false, 'momobird: ' + JSON.stringify(value));
+  }
+});
+
+test('isSyncable keeps posts whose momobird value is not an opt-out', () => {
+  const kept = [undefined, null, true, 1, 'true', 'yes', 'Yes', 'on', '', 'anything'];
+  for (const value of kept) {
+    assert.equal(isSyncable(makePost({ momobird: value }), opts), true, 'momobird: ' + JSON.stringify(value));
+  }
+});
+
+test('isSyncable treats any password value except empty as encrypted', () => {
+  const encrypted = ['x', 'hunter2', '0', ' ', 0, 123, 1, true, false, NaN, [], {}];
+  for (const value of encrypted) {
+    assert.equal(isSyncable(makePost({ password: value }), opts), false, 'password: ' + JSON.stringify(value));
+  }
+  for (const value of [undefined, null, '']) {
+    assert.equal(isSyncable(makePost({ password: value }), opts), true, 'password: ' + JSON.stringify(value));
+  }
+});
+
 test('isSyncable follows the site future setting for tomorrow posts', () => {
   const post = makePost({ date: TOMORROW });
   assert.equal(isSyncable(post, { future: false, now: NOW }), false);
