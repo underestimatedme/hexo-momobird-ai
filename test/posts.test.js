@@ -4,7 +4,11 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('crypto');
 
-const { isSyncable, topCategory, mapPost, collectLocal } = require('../lib/posts');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+const { isSyncable, exclusionOf, topCategory, mapPost, collectLocal, listPostFiles } = require('../lib/posts');
 const { externalId } = require('../lib/post-id');
 
 const NOW = new Date('2026-10-28T12:00:00.000Z');
@@ -151,6 +155,37 @@ test('isSyncable still applies the other rules to future posts when future is on
 });
 
 // --------------------------------------------------------------- topCategory
+
+test('exclusionOf names why a post is left out, in the order isSyncable checks', () => {
+  const opts = { future: false, now: NOW };
+  assert.equal(exclusionOf(makePost(), opts), null);
+  assert.equal(exclusionOf(makePost({ source: '_drafts/x.md', published: false }), opts), 'draft');
+  assert.equal(exclusionOf(makePost({ published: false }), opts), 'unpublished');
+  assert.equal(exclusionOf(makePost({ password: 'x' }), opts), 'encrypted');
+  assert.equal(exclusionOf(makePost({ hidden: true }), opts), 'hidden');
+  assert.equal(exclusionOf(makePost({ hide: 'yes' }), opts), 'hidden');
+  assert.equal(exclusionOf(makePost({ momobird: 'off' }), opts), 'opted_out');
+  assert.equal(exclusionOf(makePost({ date: TOMORROW }), opts), 'scheduled');
+  assert.equal(exclusionOf(makePost({ date: TOMORROW }), { future: true, now: NOW }), null);
+  // The first rule that applies wins.
+  assert.equal(exclusionOf(makePost({ published: false, password: 'x', hidden: true }), opts), 'unpublished');
+});
+
+test('isSyncable is exactly "exclusionOf found nothing"', () => {
+  const opts = { future: false, now: NOW };
+  const posts = [
+    makePost(),
+    makePost({ published: false }),
+    makePost({ password: 0 }),
+    makePost({ hide: 'on' }),
+    makePost({ momobird: false }),
+    makePost({ date: TOMORROW }),
+    makePost({ date: YESTERDAY })
+  ];
+  for (const post of posts) {
+    assert.equal(isSyncable(post, opts), exclusionOf(post, opts) === null);
+  }
+});
 
 test('topCategory prefers the first category without a parent', () => {
   const categories = [{ _id: 'b', name: 'Go', parent: 'a' }, { _id: 'a', name: '技术' }];
@@ -471,4 +506,85 @@ test('collectLocal on no posts returns an empty map and no duplicates', () => {
   const { items, duplicates } = collectLocal([], opts);
   assert.equal(items.size, 0);
   assert.deepEqual(duplicates, []);
+});
+
+// --- listPostFiles ------------------------------------------------------------
+
+const fileDirs = [];
+test.after(() => {
+  for (const dir of fileDirs) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+function sourceDirWith(files) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'hexo-momobird-files-'));
+  fileDirs.push(base);
+  const source = path.join(base, 'source');
+  for (const file of files) {
+    const full = path.join(source, ...file.split('/'));
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, 'x');
+  }
+  // Hexo's source_dir ends with a separator.
+  return source + path.sep;
+}
+
+const markdownOnly = (file) => /\.(md|markdown)$/.test(file);
+
+test('listPostFiles lists the renderable files under _posts, nested ones too, in Hexo\'s source form', () => {
+  const dir = sourceDirWith([
+    '_posts/hello.md',
+    '_posts/2026/10/nested.markdown',
+    '_posts/中文 文章.md',
+    '_posts/hello/photo.png',
+    'about/index.md',
+    '_drafts/draft.md'
+  ]);
+  assert.deepEqual(listPostFiles(dir, markdownOnly).sort(), [
+    '_posts/2026/10/nested.markdown',
+    '_posts/hello.md',
+    '_posts/中文 文章.md'
+  ]);
+});
+
+test('listPostFiles skips what Hexo\'s post processor skips: temporary and hidden files', () => {
+  const dir = sourceDirWith([
+    '_posts/kept.md',
+    '_posts/saving.md~',
+    '_posts/saving.md%',
+    '_posts/.hidden.md',
+    '_posts/_partial.md',
+    '_posts/.git/notes.md',
+    '_posts/_includes/part.md',
+    '_posts/sub/_part.md'
+  ]);
+  assert.deepEqual(listPostFiles(dir, () => true), ['_posts/kept.md']);
+});
+
+test('listPostFiles asks the renderable check with the source path', () => {
+  const dir = sourceDirWith(['_posts/a.md', '_posts/b.txt']);
+  const asked = [];
+  listPostFiles(dir, (file) => {
+    asked.push(file);
+    return true;
+  });
+  assert.deepEqual(asked.sort(), ['_posts/a.md', '_posts/b.txt']);
+});
+
+test('listPostFiles is empty when there is no _posts directory', () => {
+  assert.deepEqual(listPostFiles(sourceDirWith(['about/index.md']), () => true), []);
+});
+
+test('listPostFiles follows directory symlinks like Hexo, but not one that points back up', () => {
+  const dir = sourceDirWith(['_posts/a.md', 'shared/b.md']);
+  fs.symlinkSync(path.join(dir, 'shared'), path.join(dir, '_posts', 'shared'));
+  fs.symlinkSync(path.join(dir, 'shared'), path.join(dir, '_posts', 'again'));
+  fs.symlinkSync(path.join(dir, '_posts'), path.join(dir, '_posts', 'loop'));
+  assert.deepEqual(listPostFiles(dir, () => true).sort(), ['_posts/a.md', '_posts/again/b.md', '_posts/shared/b.md']);
+});
+
+test('listPostFiles source paths give the same ids as the posts Hexo read', () => {
+  const dir = sourceDirWith(['_posts/2026/hello.md']);
+  const [source] = listPostFiles(dir, () => true);
+  assert.equal(externalId(source), externalId('_posts/2026/hello.md'));
+  assert.equal(externalId(source), externalId('_posts\\2026\\hello.md'));
 });

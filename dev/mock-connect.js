@@ -8,13 +8,20 @@
 //
 //   node dev/mock-connect.js --site-url https://hexo.example.com \
 //        --log /tmp/mock.jsonl [--port 0] [--port-file /tmp/mock.port] \
-//        [--put-status 500]
+//        [--put-status 500] [--plan expired] [--seed 123,456]
 //
 //   --site-url     the source's site_url as /status reports it (required)
 //   --log          JSON Lines file for the request log (default: none)
 //   --port         port on 127.0.0.1; 0 or absent lets the OS pick one
 //   --port-file    where to write the chosen port once the server listens
 //   --put-status   answer PUT /posts with this error status instead of storing
+//   --plan         `expired`: the plan has run out. Like MomoBird, the mock
+//                  then answers PUT /posts and POST /widget/enable with 402
+//                  PLAN_REQUIRED, and keeps listing and deleting posts.
+//                  /status reports the expired plan; the widget state is left
+//                  at not_published, so a plugin that tried to switch it on
+//                  after a 402 would show up in the log.
+//   --seed         comma-separated external ids MomoBird already holds
 //
 // Written for Node 14 as well as newer versions: no optional chaining, no
 // global fetch.
@@ -58,6 +65,8 @@ function originOf(value) {
 // opts.logFile     optional path; every request is appended as one JSON line
 // opts.port        optional; 0 / undefined = OS-assigned
 // opts.putStatus   optional; PUT /posts fails with this status
+// opts.planExpired optional; PUT /posts and POST /widget/enable answer 402
+// opts.seed        optional; external ids the mock holds from the start
 function startMock(opts) {
   const options = opts || {};
   if (!options.siteUrl) throw new Error('startMock needs siteUrl');
@@ -68,6 +77,9 @@ function startMock(opts) {
     posts: new Map(),
     widget: { public_id: WIDGET_PUBLIC_ID, available: false, reason: 'not_published' }
   };
+  for (const id of options.seed || []) {
+    state.posts.set(String(id), { external_id: String(id), seeded: true });
+  }
   const requests = [];
 
   function record(entry) {
@@ -88,12 +100,19 @@ function startMock(opts) {
         document_count: state.posts.size,
         ready_document_count: state.posts.size
       },
-      entitlement: {
-        status: 'trial',
-        active: true,
-        trial_ends_at: new Date(Date.now() + 6 * 86400 * 1000).toISOString(),
-        pro_ends_at: null
-      },
+      entitlement: options.planExpired
+        ? {
+            status: 'expired',
+            active: false,
+            trial_ends_at: new Date(Date.now() - 86400 * 1000).toISOString(),
+            pro_ends_at: null
+          }
+        : {
+            status: 'trial',
+            active: true,
+            trial_ends_at: new Date(Date.now() + 6 * 86400 * 1000).toISOString(),
+            pro_ends_at: null
+          },
       widget: Object.assign({}, state.widget)
     };
   }
@@ -110,7 +129,15 @@ function startMock(opts) {
     });
   }
 
+  function planRequired(res) {
+    fail(res, 402, 'PLAN_REQUIRED', 'an active plan is required');
+  }
+
   function putPosts(res, body) {
+    if (options.planExpired) {
+      planRequired(res);
+      return;
+    }
     if (options.putStatus) {
       fail(res, options.putStatus, 'MOCK_FAILURE', 'mock PUT failure');
       return;
@@ -156,6 +183,10 @@ function startMock(opts) {
   }
 
   function enableWidget(res) {
+    if (options.planExpired) {
+      planRequired(res);
+      return;
+    }
     if (state.posts.size === 0) {
       fail(res, 409, 'WIDGET_NOT_READY', 'no indexed posts yet');
       return;
@@ -262,11 +293,16 @@ async function main() {
   if (!args['site-url']) {
     throw new Error('--site-url is required');
   }
+  if (args.plan !== undefined && args.plan !== 'expired' && args.plan !== 'active') {
+    throw new Error('--plan must be expired or active');
+  }
   const mock = await startMock({
     siteUrl: args['site-url'],
     logFile: args.log,
     port: args.port ? parseInt(args.port, 10) : 0,
-    putStatus: args['put-status'] ? parseInt(args['put-status'], 10) : 0
+    putStatus: args['put-status'] ? parseInt(args['put-status'], 10) : 0,
+    planExpired: args.plan === 'expired',
+    seed: args.seed ? args.seed.split(',').filter((id) => id !== '') : []
   });
   if (args['port-file']) {
     fs.writeFileSync(args['port-file'], String(mock.port) + '\n');

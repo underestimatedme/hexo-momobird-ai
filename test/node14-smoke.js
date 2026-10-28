@@ -82,11 +82,11 @@ function fixedValues() {
     cache: { 2: 'd2', 3: 'old' },
     prune: false
   });
-  assert.deepStrictEqual(plan, { push: ['1', '3'], remove: ['9'], pruneSkipped: false });
+  assert.deepStrictEqual(plan, { push: ['1', '3'], remove: ['9'], pruneSkipped: false, held: [] });
   const empty = reconcile.planSync({ local: new Map(), remoteIds: new Set(['9']), cache: {}, prune: false });
-  assert.deepStrictEqual(empty, { push: [], remove: [], pruneSkipped: true });
+  assert.deepStrictEqual(empty, { push: [], remove: [], pruneSkipped: true, held: [] });
   const pruned = reconcile.planSync({ local: new Map(), remoteIds: new Set(['9']), cache: {}, prune: true });
-  assert.deepStrictEqual(pruned, { push: [], remove: ['9'], pruneSkipped: false });
+  assert.deepStrictEqual(pruned, { push: [], remove: ['9'], pruneSkipped: false, held: [] });
   step('planSync');
 
   assert.strictEqual(
@@ -189,11 +189,45 @@ async function syncsAgainstTheMock() {
   }
 }
 
+// After the plan expires the server refuses pushes (402) but still lists and
+// deletes: the posts the site no longer has must still come down.
+async function removesAfterExpiry() {
+  const gone = postId.externalId('_posts/gone.md');
+  const kept = postId.externalId('_posts/one.md');
+  const server = await mock.startMock({ siteUrl: SITE_URL, planExpired: true, seed: [kept, gone] });
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hexo-momobird-smoke-'));
+  try {
+    const api = client.createClient({ api: server.url, key: KEY, retryDelaysMs: [] });
+    const collected = posts.collectLocal(
+      [fakePost('_posts/one.md', '第一篇', '<p>你好</p>'), fakePost('_posts/new.md', '新文章', '<p>新的</p>')],
+      { future: true, now: new Date('2026-11-01T00:00:00Z') }
+    );
+    const cacheFile = cache.cachePath(dir, mock.SOURCE_ID);
+    const report = await reconcile.runSync({ client: api, local: collected.items, cacheFile, prune: false, dryRun: false });
+
+    assert.strictEqual(report.planRequired.length, 2);
+    assert.strictEqual(report.removed, 1);
+    assert.strictEqual(server.requests.filter((r) => r.method === 'PUT').length, 1);
+    assert.deepStrictEqual(server.requests.filter((r) => r.path.slice(-13) === '/posts/delete').map((r) => r.body.external_ids), [[gone]]);
+    assert.deepStrictEqual(cache.readCache(cacheFile), {});
+
+    fs.mkdirSync(path.join(dir, 'source', '_posts', 'sub'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'source', '_posts', 'sub', 'a.md'), 'x');
+    fs.writeFileSync(path.join(dir, 'source', '_posts', '.b.md'), 'x');
+    assert.deepStrictEqual(posts.listPostFiles(path.join(dir, 'source') + path.sep, () => true), ['_posts/sub/a.md']);
+    step('402: pushing stops, the removal still goes out, nothing is cached; listPostFiles');
+  } finally {
+    await server.close();
+    removeDir(dir);
+  }
+}
+
 async function main() {
   loadsEverything();
   fixedValues();
   registersIntoHexo();
   await syncsAgainstTheMock();
+  await removesAfterExpiry();
   process.stdout.write('node14 smoke: all passed on ' + process.version + '\n');
 }
 

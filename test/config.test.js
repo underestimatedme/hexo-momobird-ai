@@ -5,7 +5,9 @@ const assert = require('node:assert/strict');
 
 const { readConfig, ConfigError } = require('../lib/config');
 
-const KEY_MESSAGE = '连接密钥不能写在 _config.yml 里，请删掉它并改用环境变量 MOMOBIRD_KEY';
+const KEY_MESSAGE =
+  '连接密钥不能写在 _config.yml 里，请删掉它并改用环境变量 MOMOBIRD_KEY。' +
+  '已提交到仓库的密钥请在 MomoBird 控制台重新生成';
 
 const DEFAULTS = {
   key: null,
@@ -63,24 +65,89 @@ test('readConfig maps every option from the momobird section', () => {
   });
 });
 
-test('readConfig keeps the default for anything that is not a boolean', () => {
+// YAML 1.2 (js-yaml, which Hexo uses) reads `sync: off` and `sync: no` as the
+// strings "off" and "no", and `sync: 1` as the number 1.
+test('boolean options accept yes/no, on/off and 1/0 as well as true/false', () => {
+  const cases = [
+    [{ sync: 'off' }, 'sync', false],
+    [{ sync: 'no' }, 'sync', false],
+    [{ sync: ' No ' }, 'sync', false],
+    [{ sync: 'false' }, 'sync', false],
+    [{ sync: 0 }, 'sync', false],
+    [{ sync: '0' }, 'sync', false],
+    [{ widget: 1 }, 'widget', true],
+    [{ widget: '1' }, 'widget', true],
+    [{ widget: 'yes' }, 'widget', true],
+    [{ widget: 'ON' }, 'widget', true],
+    [{ widget: 'true' }, 'widget', true],
+    [{ podcast: 'off' }, 'podcast', false],
+    [{ podcast_transcript: 'yes' }, 'podcastTranscript', true],
+    [{ strict: 'on' }, 'strict', true],
+    [{ strict: 1 }, 'strict', true]
+  ];
+  for (const [section, name, expected] of cases) {
+    const warnings = [];
+    const config = readConfig({ momobird: section }, {}, (text) => warnings.push(text));
+    assert.equal(config[name], expected, JSON.stringify(section));
+    assert.deepEqual(warnings, [], JSON.stringify(section));
+  }
+});
+
+test('an unrecognised boolean value is one warning naming the option and the value, and the default applies', () => {
+  const warnings = [];
   const config = readConfig(
-    {
-      momobird: {
-        sync: 'false',
-        widget: 'true',
-        podcast: 0,
-        podcast_transcript: 'yes',
-        strict: 1
-      }
-    },
-    {}
+    { momobird: { sync: 'nope', widget: 2, podcast: 'disabled', podcast_transcript: [], strict: 'sometimes' } },
+    {},
+    (text) => warnings.push(text)
   );
   assert.equal(config.sync, true);
   assert.equal(config.widget, false);
   assert.equal(config.podcast, true);
   assert.equal(config.podcastTranscript, false);
   assert.equal(config.strict, false);
+  assert.equal(warnings.length, 5);
+  assert.ok(warnings[0].includes('sync') && warnings[0].includes('nope'), warnings[0]);
+  assert.ok(warnings[1].includes('widget') && warnings[1].includes('2'), warnings[1]);
+  assert.ok(warnings[2].includes('podcast') && warnings[2].includes('disabled'), warnings[2]);
+  assert.ok(warnings[3].includes('podcast_transcript'), warnings[3]);
+  assert.ok(warnings[4].includes('strict') && warnings[4].includes('sometimes'), warnings[4]);
+  for (const text of warnings) {
+    assert.ok(/[一-鿿]/.test(text), text);
+    assert.ok(text.includes('默认值'), text);
+  }
+});
+
+test('an empty boolean option uses the default without a warning', () => {
+  const warnings = [];
+  const config = readConfig({ momobird: { sync: null, widget: undefined } }, {}, (text) => warnings.push(text));
+  assert.equal(config.sync, true);
+  assert.equal(config.widget, false);
+  assert.deepEqual(warnings, []);
+});
+
+test('momobird: false turns sync, widget and podcast off', () => {
+  for (const value of [false, 'false', 'no', 'off', ' OFF ', 0, '0']) {
+    const warnings = [];
+    const config = readConfig({ momobird: value }, {}, (text) => warnings.push(text));
+    assert.equal(config.sync, false, JSON.stringify(value));
+    assert.equal(config.widget, false, JSON.stringify(value));
+    assert.equal(config.podcast, false, JSON.stringify(value));
+    assert.deepEqual(warnings, [], JSON.stringify(value));
+  }
+});
+
+test('momobird: true, yes or on keeps the defaults; any other plain value is a warning', () => {
+  for (const value of [true, 'yes', 'on', 1]) {
+    const warnings = [];
+    assert.deepEqual(readConfig({ momobird: value }, {}, (text) => warnings.push(text)), DEFAULTS, JSON.stringify(value));
+    assert.deepEqual(warnings, [], JSON.stringify(value));
+  }
+  for (const value of ['sometimes', 7, ['sync']]) {
+    const warnings = [];
+    assert.deepEqual(readConfig({ momobird: value }, {}, (text) => warnings.push(text)), DEFAULTS, JSON.stringify(value));
+    assert.equal(warnings.length, 1, JSON.stringify(value));
+    assert.ok(warnings[0].includes('momobird'), warnings[0]);
+  }
 });
 
 test('readConfig falls back to the right side for an unknown widget_position', () => {
@@ -125,6 +192,16 @@ test('a key field in the momobird section is refused without echoing it', () => 
       assert.equal(err.name, 'ConfigError');
       assert.equal(err.message, KEY_MESSAGE);
       assert.ok(!err.message.includes('x'));
+      return true;
+    }
+  );
+});
+
+test('the key-in-config error tells the user to regenerate a key that was committed', () => {
+  assert.throws(
+    () => readConfig({ momobird: { key: 'x' } }, {}),
+    (err) => {
+      assert.ok(err.message.includes('已提交到仓库的密钥请在 MomoBird 控制台重新生成'), err.message);
       return true;
     }
   );

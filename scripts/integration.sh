@@ -14,8 +14,10 @@
 #
 # Check numbers 1-10 are the Hexo-runtime assumptions Task 7's review listed
 # (check 11, Node 14, is test/node14-smoke.js); B4-B9 are the numbered steps of
-# the task; X1-X5 are extra scenarios; T and C are the theme-field and
-# category-order observations.
+# the task; X1-X5 are extra scenarios; X7 is a plan that expired (402 on
+# push), X8 a post whose front-matter Hexo cannot parse, X9 flag values as
+# hexo-cli really parses them; T and C are the theme-field and category-order
+# observations.
 
 set -euo pipefail
 
@@ -322,6 +324,24 @@ EOF
     "$(requests_line "$M1_LOG" "$mark")" \
     eq "$(count_requests "$M1_LOG" "$mark" '^(PUT|POST /posts/delete)')" 0
 
+  # --- X9: --prune and --dry-run with a value are usage errors ----------------
+  # hexo-cli parses these with minimist; the values below must stop the
+  # command before anything is loaded or sent.
+  local spelling label
+  for spelling in --prune=no --prune=false --prune=0 --no-prune --dry-run=no --dry-run=false; do
+    label="badflag${spelling//[^a-z0-9]/-}"
+    mark="$(lines_of "$M1_LOG")"
+    hexo_run "$label" key momobird sync "$spelling"
+    verdict X9 "momobird sync $spelling is a usage error: non-zero exit, the usage line, no request" \
+      "exit $RC; $(grep -h '参数 --' "$OUT/$label.log" | sed 's/^[A-Z]* *//' | head -1); requests: $(requests_line "$M1_LOG" "$mark")" \
+      eq "$([ "$RC" -ne 0 ] && echo nonzero || echo zero):$(grep -c '的值无法识别.*用法：hexo momobird' "$OUT/$label.log" || true):$(lines_of "$M1_LOG")" "nonzero:1:$mark"
+  done
+  mark="$(lines_of "$M1_LOG")"
+  hexo_run goodflag key momobird sync --dry-run= --prune=true
+  verdict X9 "momobird sync --dry-run= --prune=true is accepted (a dry run, nothing sent)" \
+    "exit $RC; $(grep -h '试运行' "$OUT/goodflag.log" | sed 's/^[A-Z]* *//' | head -1); $(requests_line "$M1_LOG" "$mark")" \
+    eq "$RC:$(grep -c '试运行' "$OUT/goodflag.log" || true):$(count_requests "$M1_LOG" "$mark" '^(PUT|POST)')" "0:1:0"
+
   # --- main generate: B4, B5, 1, 3, 6, 7, 8, 10, T -----------------------------
   hexo_run clean0 none clean
   mark="$(lines_of "$M1_LOG")"
@@ -608,6 +628,66 @@ EOF
   verdict X3 "wrong key: build succeeds with the 401 explanation, the key is not printed" \
     "exit $RC; $(grep -h '连接密钥无效' "$OUT/badkey.log" | head -1 | sed 's/^[A-Z]* *//')" \
     eq "$RC:$(grep -c '连接密钥无效' "$OUT/badkey.log" || true):$(grep -c -F -e "$BAD_KEY" -e WRONGKEY "$OUT/badkey.log" || true)" "0:1:0"
+
+  # --- X7: the plan expired: pushes stop, removals still go out ------------------------------
+  # MomoBird already holds the three syncable posts and hello-world, which the
+  # site deleted earlier. With the plan expired it refuses PUT /posts (402) but
+  # still lists and deletes, so hello-world must come down anyway. The mock
+  # leaves the widget at not_published: an enable request after the 402 would
+  # show up in its log.
+  local expired_seed probe_id_now cache_file
+  probe_id_now="$(h external-id _posts/multi-root-probe.md)"
+  expired_seed="$nested_id,$extra_id,$probe_id_now,$hello_id"
+  cache_file="$SITE/node_modules/.cache/hexo-momobird-ai/$SOURCE_ID.json"
+  start_mock M4 "$SITE_URL" --plan expired --seed "$expired_seed"
+  printf 'momobird:\n  api: http://127.0.0.1:%s\n' "$M4_PORT" > "$SITE/_m4.yml"
+  CFG="_config.yml,_m4.yml"
+  rm -rf "$SITE/node_modules/.cache"
+  hexo_run expired-g key generate
+  verdict X7 "expired plan: one PUT answered 402, then the delete of the removed post, no widget enable, exit 0" \
+    "exit $RC; $(requests_line "$M4_LOG" 0); deleted: $(h deleted < "$M4_LOG" | paste -sd, -) (hello-world=$hello_id)" \
+    eq "$RC:$(count_requests "$M4_LOG" 0 '^PUT /posts -> 402'):$(count_requests "$M4_LOG" 0 '^PUT'):$(h deleted < "$M4_LOG" | paste -sd, -):$(count_requests "$M4_LOG" 0 '^POST /widget/enable')" "0:1:1:$hello_id:0"
+  verdict X7 "expired plan: the log says new and changed posts were not synced and how many were taken down" \
+    "$(grep -h '套餐已到期' "$OUT/expired-g.log" | sed 's/^[A-Z]* *//' | paste -sd'|' - | sed 's/|/ | /g')" \
+    eq "$(grep -c '同步未完成：套餐已到期，新增或修改的 3 篇文章没有同步' "$OUT/expired-g.log" || true):$(grep -c '本次下线 1 篇' "$OUT/expired-g.log" || true):$(grep -c '同步完成' "$OUT/expired-g.log" || true)" "1:1:0"
+  verdict X7 "expired plan: the cache records none of the posts the server did not take" \
+    "cache: $(cat "$cache_file" 2>/dev/null || echo '(missing)')" \
+    eq "$(cat "$cache_file" 2>/dev/null)" "{}"
+
+  start_mock M5 "$SITE_URL" --plan expired --seed "$expired_seed"
+  printf 'momobird:\n  api: http://127.0.0.1:%s\n' "$M5_PORT" > "$SITE/_m5.yml"
+  CFG="_config.yml,_m5.yml,_strict.yml"
+  hexo_run expired-strict key generate
+  verdict X7 "expired plan with strict: true: the delete still goes out and hexo g exits non-zero" \
+    "exit $RC; $(requests_line "$M5_LOG" 0); $(grep -h -E 'MomoBirdError|套餐已到期' "$OUT/expired-strict.log" | head -2 | tr '\n' ' ')" \
+    eq "$([ "$RC" -ne 0 ] && echo nonzero || echo zero):$(h deleted < "$M5_LOG" | paste -sd, -):$(count_requests "$M5_LOG" 0 '^POST /widget/enable')" "nonzero:$hello_id:0"
+  CFG="_config.yml,_mock.yml"
+
+  # --- X8: a post Hexo cannot read is not taken down ---------------------------------------
+  # A front-matter Hexo cannot parse makes it log "Process failed" and go on
+  # without the post. After a clean, the post is missing from Hexo's model
+  # although its file is there; MomoBird still holds it and must keep it. The
+  # front-matter is ASCII because Hexo prints it with the error, and the log
+  # check above wants every Chinese line to carry [MomoBird].
+  local broken_src="_posts/broken-front-matter.md" broken_id
+  broken_id="$(h external-id "$broken_src")"
+  printf -- '---\ntitle: Broken front-matter\ndate: 2026-10-26 08:00:00\ntags: [one, two\n---\n\nThis post has a front-matter typo.\n' \
+    > "$SITE/source/$broken_src"
+  start_mock M6 "$SITE_URL" --seed "$nested_id,$extra_id,$probe_id_now,$broken_id,$hello_id"
+  printf 'momobird:\n  api: http://127.0.0.1:%s\n' "$M6_PORT" > "$SITE/_m6.yml"
+  CFG="_config.yml,_m6.yml"
+  hexo_run clean6 none clean
+  rm -rf "$SITE/node_modules/.cache"
+  hexo_run unreadable-g key generate
+  verdict X8 "unreadable post: Hexo reports it, the plugin names it and keeps it, the deleted post still goes" \
+    "exit $RC; hexo: $(grep -v -F '[MomoBird]' "$OUT/unreadable-g.log" | grep -o 'Process failed.*' | head -1); plugin: $(grep -h 'Hexo 没能读取' "$OUT/unreadable-g.log" | sed 's/^[A-Z]* *//' | head -1); deleted: $(h deleted < "$M6_LOG" | paste -sd, -) (broken=$broken_id, hello-world=$hello_id)" \
+    eq "$RC:$(grep -v -F '[MomoBird]' "$OUT/unreadable-g.log" | grep -c "Process failed.*$broken_src" || true):$(grep -c "Hexo 没能读取这篇文章，暂不下线：$broken_src" "$OUT/unreadable-g.log" || true):$(h deleted < "$M6_LOG" | paste -sd, -)" "0:1:1:$hello_id"
+  mark="$(lines_of "$M6_LOG")"
+  hexo_run unreadable-dry key momobird sync --dry-run --prune
+  verdict X8 "unreadable post: momobird sync --dry-run --prune names it and does not list it for removal" \
+    "exit $RC; $(grep -h -E 'Hexo 没能读取|将下线' "$OUT/unreadable-dry.log" | sed 's/^[A-Z]* *//' | paste -sd'|' - | sed 's/|/ | /g')" \
+    eq "$RC:$(grep -c "暂不下线：$broken_src" "$OUT/unreadable-dry.log" || true):$(grep -c '将下线' "$OUT/unreadable-dry.log" || true):$(count_requests "$M6_LOG" "$mark" '^(PUT|POST)')" "0:1:0:0"
+  rm -f "$SITE/source/$broken_src"
 
   # --- 10, B9: logs and secrets --------------------------------------------------------------------
   local lint

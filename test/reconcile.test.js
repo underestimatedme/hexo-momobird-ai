@@ -140,7 +140,7 @@ test('planSync with a complete cache and remote has nothing to do', () => {
     cache: digestsOf(ids('p', 5)),
     prune: false
   });
-  assert.deepEqual(plan, { push: [], remove: [], pruneSkipped: false });
+  assert.deepEqual(plan, { push: [], remove: [], pruneSkipped: false, held: [] });
 });
 
 test('planSync takes down what the remote has and the site no longer has', () => {
@@ -252,9 +252,36 @@ test('planSync with prune removes everything the site no longer has', () => {
   assert.equal(most.pruneSkipped, false);
 });
 
+test('planSync never removes a post whose file Hexo could not read', () => {
+  const plan = planSync({
+    local: localOf(['a']),
+    remoteIds: new Set(['a', 'broken', 'gone']),
+    cache: digestsOf(['a']),
+    prune: false,
+    unreadable: new Map([['broken', '_posts/broken.md'], ['new-broken', '_posts/new-broken.md']])
+  });
+  assert.deepEqual(plan.remove, ['gone']);
+  assert.deepEqual(plan.held, ['broken']);
+  assert.equal(plan.pruneSkipped, false);
+});
+
+test('planSync holds unreadable posts even with --prune, and they do not count towards the guard', () => {
+  // 13 on the remote, 2 local, 10 unreadable: only 1 removal, well under the guard.
+  const unreadable = new Map(ids('u', 10).map((id) => [id, '_posts/' + id + '.md']));
+  const remote = new Set(['a', 'b', 'gone'].concat(ids('u', 10)));
+  const plan = planSync({ local: localOf(['a', 'b']), remoteIds: remote, cache: {}, prune: false, unreadable });
+  assert.deepEqual(plan.remove, ['gone']);
+  assert.equal(plan.held.length, 10);
+  assert.equal(plan.pruneSkipped, false);
+
+  const pruned = planSync({ local: new Map(), remoteIds: remote, cache: {}, prune: true, unreadable });
+  assert.deepEqual(pruned.remove, ['a', 'b', 'gone']);
+  assert.equal(pruned.held.length, 10);
+});
+
 test('planSync does not report a skipped prune when there was nothing to remove', () => {
   const plan = planSync({ local: new Map(), remoteIds: new Set(), cache: {}, prune: false });
-  assert.deepEqual(plan, { push: [], remove: [], pruneSkipped: false });
+  assert.deepEqual(plan, { push: [], remove: [], pruneSkipped: false, held: [] });
 });
 
 // --- runSync ----------------------------------------------------------------
@@ -449,16 +476,16 @@ test('a 500 on the second push batch throws, takes nothing down and writes no ca
   assert.equal(fs.existsSync(cacheFile), false);
 });
 
-test('a fatal error leaves an existing cache untouched', async () => {
+test('a fatal error keeps the cache, minus the posts it was about to push', async () => {
   const cacheFile = tmpCacheFile();
-  writeCache(cacheFile, { a: 'old' });
-  const client = fakeClient({ remote: [], upsert: () => { throw apiError(401); } });
+  writeCache(cacheFile, { a: 'old', b: 'digest-b' });
+  const client = fakeClient({ remote: ['b'], upsert: () => { throw apiError(401); } });
 
   await assert.rejects(
-    runSync({ client, local: localOf(['a']), cacheFile, prune: false, dryRun: false, log: fakeLog() }),
+    runSync({ client, local: localOf(['a', 'b']), cacheFile, prune: false, dryRun: false, log: fakeLog() }),
     (err) => err instanceof ConnectError && err.status === 401
   );
-  assert.deepEqual(readCache(cacheFile), { a: 'old' });
+  assert.deepEqual(readCache(cacheFile), { b: 'digest-b' });
 });
 
 test('a fatal error while taking posts down throws and writes no cache', async () => {
@@ -629,6 +656,207 @@ test('a 413 is only a rejection for http errors; other statuses and network erro
   }
 });
 
+test('a post Hexo could not read stays online, with one warning naming its file', async () => {
+  const cacheFile = tmpCacheFile();
+  writeCache(cacheFile, digestsOf(['a', 'broken']));
+  const log = fakeLog();
+  const client = fakeClient({ remote: ['a', 'broken', 'gone'] });
+
+  const report = await runSync({
+    client,
+    local: localOf(['a']),
+    cacheFile,
+    prune: false,
+    dryRun: false,
+    log,
+    unreadable: new Map([['broken', '_posts/broken.md'], ['offline', '_posts/offline.md']])
+  });
+
+  assert.deepEqual(ops(client, 'delete').map((c) => c.ids), [['gone']]);
+  assert.deepEqual(report.planned.remove, ['gone']);
+  assert.deepEqual(report.held, ['broken']);
+  const warnings = log.lines.filter((l) => l.level === 'warn').map((l) => l.message);
+  assert.equal(warnings.length, 1, warnings.join('\n'));
+  assert.ok(warnings[0].startsWith('[MomoBird] Hexo 没能读取这篇文章，暂不下线：_posts/broken.md'), warnings[0]);
+  assert.ok(warnings[0].includes('front-matter'), warnings[0]);
+  // Still on MomoBird, so its record stays.
+  assert.deepEqual(readCache(cacheFile), digestsOf(['a', 'broken']));
+});
+
+test('a dry run warns about a post Hexo could not read as well', async () => {
+  const log = fakeLog();
+  const client = fakeClient({ remote: ['broken'] });
+
+  const report = await runSync({
+    client,
+    local: new Map(),
+    cacheFile: tmpCacheFile(),
+    prune: true,
+    dryRun: true,
+    log,
+    unreadable: new Map([['broken', '_posts/broken.md']])
+  });
+
+  assert.deepEqual(report.planned.remove, []);
+  assert.ok(log.lines.some((l) => l.level === 'warn' && l.message.includes('_posts/broken.md')));
+});
+
+test('holdRemovals pushes as usual but takes nothing down, and counts what it kept', async () => {
+  const client = fakeClient({ remote: ['a', 'other1', 'other2', 'broken'] });
+  const log = fakeLog();
+
+  const report = await runSync({
+    client,
+    local: localOf(['a', 'b']),
+    cacheFile: tmpCacheFile(),
+    prune: false,
+    dryRun: false,
+    log,
+    holdRemovals: true,
+    unreadable: new Map([['broken', '_posts/broken.md']])
+  });
+
+  assert.deepEqual(client.calls.map((c) => c.op), ['list', 'upsert']);
+  assert.deepEqual(report.planned.remove, []);
+  assert.equal(report.withheld, 2);
+  assert.equal(report.pruneSkipped, false);
+  assert.ok(!log.lines.some((l) => l.message.includes('清理保护')), 'the guard is not what kept them');
+});
+
+test('without holdRemovals nothing is withheld', async () => {
+  const report = await runSync({ client: fakeClient({ remote: ['gone'] }), local: localOf(['a']), cacheFile: tmpCacheFile(), prune: false, dryRun: false, log: fakeLog() });
+  assert.equal(report.withheld, 0);
+  assert.equal(report.removed, 1);
+});
+
+// --- 402: the plan expired -----------------------------------------------------
+
+// The server refuses pushes once the plan has expired, but still lists and
+// deletes, so a post that was deleted or hidden must still come down.
+function planRequired() {
+  return new ConnectError({ kind: 'http', status: 402, code: 'PLAN_REQUIRED' });
+}
+
+test('402 on push still takes down removed or hidden posts', async () => {
+  const cacheFile = tmpCacheFile();
+  // a was accepted earlier and has not changed; b changed since; c is new;
+  // gone was deleted or hidden on the site.
+  writeCache(cacheFile, { a: 'digest-a', b: 'digest-b-before', gone: 'digest-gone' });
+  const log = fakeLog();
+  const client = fakeClient({
+    remote: ['a', 'b', 'gone'],
+    upsert: () => {
+      throw planRequired();
+    }
+  });
+
+  const report = await runSync({ client, local: localOf(['a', 'b', 'c']), cacheFile, prune: false, dryRun: false, log });
+
+  // One push request, refused; nothing more is pushed.
+  assert.deepEqual(ops(client, 'upsert').map((c) => c.ids), [['b', 'c']]);
+  assert.deepEqual(report.planRequired, ['b', 'c']);
+  assert.deepEqual(report.rejected, []);
+  assert.equal(report.pushed, 0);
+  assert.equal(report.unchanged, 0);
+  // The removal still goes out, after the refused push.
+  assert.deepEqual(client.calls.map((c) => c.op), ['list', 'upsert', 'delete']);
+  assert.deepEqual(ops(client, 'delete').map((c) => c.ids), [['gone']]);
+  assert.equal(report.removed, 1);
+  // The cache holds only what the server accepted: a, from before. Not b (its
+  // old digest would hide the change from the next build), not c, not gone.
+  assert.deepEqual(readCache(cacheFile), { a: 'digest-a' });
+  for (const line of log.lines) {
+    assert.ok(line.message.startsWith('[MomoBird]'), line.message);
+  }
+});
+
+test('402 on a later batch keeps the batches already accepted and stops pushing', async () => {
+  const cacheFile = tmpCacheFile();
+  const names = ids('p', 45);
+  const client = fakeClient({
+    remote: ['gone1', 'gone2'],
+    upsert: (posts, n) => {
+      if (n === 1) throw planRequired();
+      return created(posts);
+    }
+  });
+
+  const report = await runSync({ client, local: localOf(names), cacheFile, prune: false, dryRun: false, log: fakeLog() });
+
+  // The first batch went through, the second was refused, the third never sent.
+  assert.deepEqual(ops(client, 'upsert').map((c) => c.ids.length), [20, 20]);
+  assert.equal(report.pushed, 20);
+  assert.deepEqual(report.planRequired, names.slice(20));
+  assert.deepEqual(report.rejected, []);
+  assert.deepEqual(ops(client, 'delete').map((c) => c.ids), [['gone1', 'gone2']]);
+  assert.equal(report.removed, 2);
+  assert.deepEqual(readCache(cacheFile), digestsOf(names.slice(0, 20)));
+});
+
+test('402 while resending a too-large batch one post at a time stops there too', async () => {
+  const cacheFile = tmpCacheFile();
+  const client = fakeClient({
+    remote: ['gone'],
+    upsert: (posts, n) => {
+      if (n === 0) throw tooLarge();
+      if (posts[0].external_id === 'b') throw planRequired();
+      return created(posts);
+    }
+  });
+
+  const report = await runSync({ client, local: localOf(['a', 'b', 'c']), cacheFile, prune: false, dryRun: false, log: fakeLog() });
+
+  assert.deepEqual(ops(client, 'upsert').map((c) => c.ids), [['a', 'b', 'c'], ['a'], ['b']]);
+  assert.equal(report.pushed, 1);
+  assert.deepEqual(report.planRequired, ['b', 'c']);
+  assert.deepEqual(report.rejected, []);
+  assert.deepEqual(ops(client, 'delete').map((c) => c.ids), [['gone']]);
+  assert.deepEqual(readCache(cacheFile), digestsOf(['a']));
+});
+
+test('402 still respects the prune guard', async () => {
+  // 30 on the remote, 14 posts on the site (13 still on the remote, one new):
+  // 17 removals is more than 10 and more than half, so the guard holds even
+  // after a 402.
+  const local = localOf(ids('r', 13).concat(['new']));
+  const guarded = fakeClient({ remote: ids('r', 30), upsert: () => { throw planRequired(); } });
+  const log = fakeLog();
+
+  const report = await runSync({ client: guarded, local, cacheFile: tmpCacheFile(), prune: false, dryRun: false, log });
+
+  assert.equal(report.pruneSkipped, true);
+  assert.equal(report.planRequired.length, 14);
+  assert.equal(ops(guarded, 'delete').length, 0);
+  assert.equal(report.removed, 0);
+  assert.ok(log.lines.some((l) => l.level === 'warn' && l.message.includes('hexo momobird sync --prune')));
+
+  // With --prune the same removals go out.
+  const pruned = fakeClient({ remote: ids('r', 30), upsert: () => { throw planRequired(); } });
+  const prunedReport = await runSync({ client: pruned, local, cacheFile: tmpCacheFile(), prune: true, dryRun: false, log: fakeLog() });
+  assert.equal(prunedReport.pruneSkipped, false);
+  assert.equal(prunedReport.removed, 17);
+  assert.deepEqual(ops(pruned, 'delete').map((c) => c.ids), [ids('r', 17, 13)]);
+});
+
+test('a 402 when listing or taking posts down is still fatal', async () => {
+  const listing = fakeClient({ pages: { '': planRequired() } });
+  await assert.rejects(
+    runSync({ client: listing, local: localOf(['a']), cacheFile: tmpCacheFile(), prune: false, dryRun: false, log: fakeLog() }),
+    (err) => err instanceof ConnectError && err.status === 402
+  );
+
+  const removing = fakeClient({ remote: ['gone'], remove: () => { throw planRequired(); } });
+  await assert.rejects(
+    runSync({ client: removing, local: new Map([['a', localOf(['a']).get('a')]]), cacheFile: tmpCacheFile(), prune: false, dryRun: false, log: fakeLog() }),
+    (err) => err instanceof ConnectError && err.status === 402
+  );
+});
+
+test('a run without a 402 reports no plan-required posts', async () => {
+  const report = await runSync({ client: fakeClient({ remote: [] }), local: localOf(['a']), cacheFile: tmpCacheFile(), prune: false, dryRun: false, log: fakeLog() });
+  assert.deepEqual(report.planRequired, []);
+});
+
 test('a dry run only lists and writes no cache', async () => {
   const cacheFile = tmpCacheFile();
   const before = digestsOf(['a']);
@@ -738,6 +966,60 @@ test('a changed post is pushed again and its new digest replaces the old one', a
 
   assert.equal(report.pushed, 1);
   assert.deepEqual(readCache(cacheFile), { a: 'digest-a' });
+});
+
+// Cache entries must never outlive a push that may have reached the server.
+// Here the server stores the edited versions but the answer is lost; the
+// author then reverts the edits. Had the cache kept the old digests, they
+// would match again and MomoBird would keep the edited text for good.
+test('an aborted run leaves the posts it was pushing out of the cache, so the next run pushes them again', async () => {
+  const cacheFile = tmpCacheFile();
+  writeCache(cacheFile, digestsOf(['a', 'b', 'c']));
+
+  const edited = localOf(['a', 'b', 'c']);
+  edited.get('a').digest = 'digest-a-edited';
+  edited.get('b').digest = 'digest-b-edited';
+  const dropped = fakeClient({
+    remote: ['a', 'b', 'c'],
+    upsert: () => {
+      throw new ConnectError({ kind: 'network', reason: 'socket hang up' });
+    }
+  });
+  await assert.rejects(
+    runSync({ client: dropped, local: edited, cacheFile, prune: false, dryRun: false, log: fakeLog() }),
+    (err) => err instanceof ConnectError && err.kind === 'network'
+  );
+  assert.deepEqual(ops(dropped, 'upsert').map((c) => c.ids), [['a', 'b']]);
+  // c was not part of the push and keeps its record.
+  assert.deepEqual(readCache(cacheFile), digestsOf(['c']));
+
+  // The edits are reverted: a and b are back to the versions cached before.
+  const next = fakeClient({ remote: ['a', 'b', 'c'] });
+  await runSync({ client: next, local: localOf(['a', 'b', 'c']), cacheFile, prune: false, dryRun: false, log: fakeLog() });
+
+  assert.deepEqual(ops(next, 'upsert').map((c) => c.ids), [['a', 'b']]);
+  assert.deepEqual(readCache(cacheFile), digestsOf(['a', 'b', 'c']));
+});
+
+test('a cache that cannot be rewritten before the push is a warning, and the sync goes on', { skip: process.getuid && process.getuid() === 0 ? 'root ignores directory permissions' : false }, async () => {
+  const cacheFile = tmpCacheFile();
+  writeCache(cacheFile, { a: 'digest-a-old', b: 'digest-b' });
+  const dir = path.dirname(cacheFile);
+  fs.chmodSync(dir, 0o500);
+  const log = fakeLog();
+  try {
+    const client = fakeClient({ remote: ['a', 'b'] });
+    const report = await runSync({ client, local: localOf(['a', 'b']), cacheFile, prune: false, dryRun: false, log });
+
+    assert.deepEqual(ops(client, 'upsert').map((c) => c.ids), [['a']]);
+    assert.equal(report.pushed, 1);
+  } finally {
+    fs.chmodSync(dir, 0o700);
+  }
+  const warnings = log.lines.filter((l) => l.level === 'warn');
+  assert.equal(warnings.length, 1, warnings.map((l) => l.message).join('\n'));
+  assert.ok(warnings[0].message.startsWith('[MomoBird]'), warnings[0].message);
+  assert.ok(warnings[0].message.includes('缓存'), warnings[0].message);
 });
 
 test('a cache that cannot be written is a warning, not a failed sync', async () => {

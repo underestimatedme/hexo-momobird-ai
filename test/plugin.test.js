@@ -101,7 +101,10 @@ function fakeClient(opts) {
     async listPosts() {
       calls.push('list');
       return {
-        items: (o.remote || []).map((id) => ({ external_id: id, document_id: 'doc-' + id, updated_at: 'x' })),
+        // `listed` adds fields to some items (a server that also lists titles).
+        items: (o.remote || []).map((id) =>
+          Object.assign({ external_id: id, document_id: 'doc-' + id, updated_at: 'x' }, o.listed && o.listed[id])
+        ),
         next_cursor: null
       };
     },
@@ -141,12 +144,16 @@ function makeHexo(opts) {
   const posts = o.posts || [makePost('a'), makePost('b')];
   const joinQueries = [];
   const joinsOf = (post) => (o.joins && o.joins[post._id]) || post.categories || [];
+  const baseDir = o.baseDir || tmpDir();
 
   const hexo = {
     version: o.version || '8.1.2',
     env: { cmd: o.cmd === undefined ? 'g' : o.cmd, args: o.args || { _: ['g'] } },
     config: Object.assign({ url: 'https://blog.example.com', future: true, momobird: {} }, o.config),
-    base_dir: o.baseDir || tmpDir(),
+    base_dir: baseDir,
+    // Hexo's source_dir ends with a separator. The renderers of a plain site.
+    source_dir: path.join(baseDir, 'source') + path.sep,
+    render: { isRenderable: (file) => /\.(md|markdown|html?)$/i.test(file) },
     log: {
       info: (message) => logs.push({ level: 'info', message }),
       warn: (message) => logs.push({ level: 'warn', message }),
@@ -180,7 +187,9 @@ function makeHexo(opts) {
           find(query) {
             queries.push(query);
             return { toArray: () => posts.slice() };
-          }
+          },
+          // Every post Hexo read, in any state.
+          toArray: () => posts.slice()
         };
       }
       if (name === 'PostCategory') {
@@ -260,6 +269,15 @@ function setup(opts) {
     text: () => parts.logs.map((entry) => entry.message).join('\n'),
     messages: (level) => parts.logs.filter((entry) => entry.level === level).map((entry) => entry.message)
   });
+}
+
+// Writes files under the site's source directory, as a blogger would.
+function writeSource(t, files) {
+  for (const file of files) {
+    const full = path.join(t.hexo.source_dir, ...file.split('/'));
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, '---\ntitle: x\n---\nbody\n');
+  }
 }
 
 function momobird(extra) {
@@ -487,6 +505,48 @@ test('a source of another kind is a warning and the run continues', async () => 
   assert.equal(t.client.upserted.length, 2);
 });
 
+// The posts of a source of another kind were pushed by another platform; a
+// Hexo site that does not have them is no reason to take them down.
+function otherKindClient() {
+  return {
+    remote: [externalId('_posts/a.md'), '7770001', '7770002'],
+    status: makeStatus({ source: { kind: 'wordpress' } })
+  };
+}
+
+test('a source of another kind still gets the pushes, but nothing is taken down', async () => {
+  const t = setup({ client: otherKindClient() });
+
+  await t.build();
+
+  assert.equal(t.client.upserted.length, 2);
+  assert.ok(!t.client.calls.includes('delete'), t.client.calls.join(','));
+  const warnings = t.messages('warn');
+  assert.ok(warnings[0].includes('wordpress') && warnings[0].includes('不下线'), warnings[0]);
+  const held = warnings.find((w) => w.includes('2 篇'));
+  assert.ok(held && held.includes('hexo momobird sync --prune'), warnings.join('\n'));
+  assert.ok(t.text().includes('下线 0 篇'), t.text());
+});
+
+test('hexo momobird sync on a source of another kind removes only with --prune', async () => {
+  const plain = commandSetup({ client: otherKindClient() });
+  await plain.command({ _: ['sync'] });
+  assert.equal(plain.client.upserted.length, 2);
+  assert.deepEqual(plain.client.deleted, []);
+  assert.ok(plain.messages('warn').some((w) => w.includes('2 篇') && w.includes('--prune')), plain.text());
+  assert.deepEqual(plain.exitCodes, []);
+
+  const dry = commandSetup({ client: otherKindClient() });
+  await dry.command({ _: ['sync'], 'dry-run': true });
+  assert.ok(!dry.text().includes('将下线'), dry.text());
+  assert.ok(dry.messages('warn').some((w) => w.includes('2 篇')), dry.text());
+
+  const pruned = commandSetup({ client: otherKindClient() });
+  await pruned.command({ _: ['sync'], prune: true });
+  assert.deepEqual(pruned.client.deleted, ['7770001', '7770002']);
+  assert.deepEqual(pruned.exitCodes, []);
+});
+
 test('a source id that is not a uuid stops sync and frontend before any path is built', async () => {
   for (const id of ['../../etc/passwd', '', 'not-a-uuid', 42, undefined]) {
     const t = setup({
@@ -613,6 +673,28 @@ test('template_locals respects a site that hides future posts', async () => {
   });
 
   assert.equal(future.page.content, '<p>Body of a.</p>');
+});
+
+// Hexo hides scheduled posts with `!config.future`, so `future:` with nothing
+// after it (null) and `future: 0` hide them just like `future: false`.
+test('scheduled posts follow Hexo\'s truthiness of future: null and 0 hide them', async () => {
+  for (const future of [null, 0, false, '']) {
+    const later = makePost('later', { date: new Date('2026-12-01T00:00:00Z') });
+    const t = setup({
+      config: Object.assign({ future }, momobird({ podcast: true })),
+      posts: [makePost('a'), later]
+    });
+
+    await t.build();
+    const page = await t.run('template_locals', { page: postPage('later', { date: later.date }) });
+
+    assert.deepEqual(
+      t.client.upserted.map((post) => post.external_id),
+      [externalId('_posts/a.md')],
+      'future: ' + JSON.stringify(future)
+    );
+    assert.equal(page.page.content, '<p>Body of later.</p>', 'future: ' + JSON.stringify(future));
+  }
 });
 
 test('template_locals leaves pages alone when podcast is off or the build is not running', async () => {
@@ -777,6 +859,72 @@ test('a push failure rejects when strict and is one warning otherwise', async ()
   assert.ok(!lenient.text().includes('同步完成'));
 });
 
+// After the plan expires MomoBird refuses pushes (402) but still takes posts
+// down, so a deleted or hidden post must not keep answering questions.
+const PLAN_REQUIRED = new ConnectError({ kind: 'http', status: 402, code: 'PLAN_REQUIRED' });
+const DELETED_ID = externalId('_posts/deleted.md');
+
+function expiredClient() {
+  return {
+    remote: [externalId('_posts/a.md'), DELETED_ID],
+    upsertError: PLAN_REQUIRED,
+    status: makeStatus({ widget: { available: false, reason: 'not_published' } })
+  };
+}
+
+test('a 402 on push still takes posts down and leaves a lenient build green, without enabling the widget', async () => {
+  const t = setup({ config: momobird({ widget: true }), client: expiredClient() });
+
+  await t.build();
+
+  assert.deepEqual(t.client.calls, ['status', 'list', 'upsert', 'delete']);
+  assert.deepEqual(t.client.deleted, [DELETED_ID]);
+  const warnings = t.messages('warn');
+  assert.equal(warnings.length, 1, warnings.join('\n'));
+  assert.ok(warnings[0].includes('套餐已到期'), warnings[0]);
+  assert.ok(warnings[0].includes('新增或修改的 2 篇文章没有同步'), warnings[0]);
+  assert.ok(warnings[0].includes('本次下线 1 篇'), warnings[0]);
+  assert.ok(!t.text().includes('同步完成'), t.text());
+  assert.ok(!t.text().includes('同步失败'), t.text());
+  assert.deepEqual(t.messages('error'), []);
+});
+
+test('a 402 on push still takes posts down and fails a strict build', async () => {
+  const t = setup({ config: momobird({ widget: true, strict: true }), client: expiredClient() });
+
+  await t.run('before_generate');
+  await assert.rejects(t.run('after_generate'), (err) => {
+    assert.ok(err.message.includes('套餐已到期'), err.message);
+    assert.ok(err.message.includes('本次下线 1 篇'), err.message);
+    assert.ok(!err.message.includes(KEY));
+    return true;
+  });
+
+  assert.deepEqual(t.client.deleted, [DELETED_ID]);
+  assert.ok(!t.client.calls.includes('enable'));
+});
+
+test('a 402 on push leaves the cache without the posts that were not pushed', async () => {
+  const t = setup({ client: expiredClient() });
+
+  await t.build();
+
+  const file = cachePath(t.hexo.base_dir, SOURCE_ID);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), {});
+});
+
+test('hexo momobird sync after a 402 still takes posts down and exits non-zero', async () => {
+  const t = commandSetup({ client: expiredClient() });
+
+  await t.command({ _: ['sync'] });
+
+  assert.deepEqual(t.client.deleted, [DELETED_ID]);
+  assert.deepEqual(t.exitCodes, [1]);
+  const errors = t.messages('error');
+  assert.equal(errors.length, 1, errors.join('\n'));
+  assert.ok(errors[0].includes('套餐已到期') && errors[0].includes('本次下线 1 篇'), errors[0]);
+});
+
 test('a status failure skips the frontend and the sync, and rejects when strict', async () => {
   const failure = new ConnectError({ kind: 'http', status: 401 });
 
@@ -850,6 +998,48 @@ test('the prune guard warning names the manual command', async () => {
   assert.equal(t.client.deleted.length, 0);
 });
 
+// Hexo logs "Process failed" for a post whose front-matter it cannot parse and
+// carries on without it, so the post is missing from the Post model. Taking it
+// down would lose its podcast: it comes back later as a new document.
+test('a post file Hexo could not read is not taken down, and the build log names it', async () => {
+  const hidden = makePost('hidden', { hidden: true });
+  const t = setup({
+    posts: [makePost('a'), makePost('b'), hidden],
+    client: {
+      remote: [
+        externalId('_posts/a.md'),
+        externalId('_posts/b.md'),
+        externalId('_posts/broken.md'),
+        externalId('_posts/2026/nested-broken.md'),
+        externalId('_posts/hidden.md'),
+        externalId('_posts/deleted.md')
+      ]
+    }
+  });
+  writeSource(t, ['_posts/a.md', '_posts/b.md', '_posts/broken.md', '_posts/2026/nested-broken.md', '_posts/hidden.md']);
+
+  await t.build();
+
+  // The hidden post was read by Hexo, so it still comes down; so does the deleted one.
+  assert.deepEqual(t.client.deleted, [externalId('_posts/hidden.md'), externalId('_posts/deleted.md')]);
+  const warnings = t.messages('warn');
+  assert.deepEqual(warnings.filter((w) => w.includes('Hexo 没能读取')).length, 2, warnings.join('\n'));
+  assert.ok(warnings.some((w) => w.startsWith('[MomoBird] Hexo 没能读取这篇文章，暂不下线：_posts/broken.md')), warnings.join('\n'));
+  assert.ok(warnings.some((w) => w.includes('：_posts/2026/nested-broken.md')), warnings.join('\n'));
+  assert.ok(t.text().includes('下线 2 篇'), t.text());
+});
+
+test('hexo momobird sync keeps an unreadable post online too, even with --prune', async () => {
+  const t = commandSetup({ client: { remote: [externalId('_posts/broken.md'), externalId('_posts/deleted.md')] } });
+  writeSource(t, ['_posts/a.md', '_posts/b.md', '_posts/broken.md']);
+
+  await t.command({ _: ['sync'], prune: true });
+
+  assert.deepEqual(t.client.deleted, [externalId('_posts/deleted.md')]);
+  assert.ok(t.messages('warn').some((w) => w.includes('暂不下线：_posts/broken.md')));
+  assert.deepEqual(t.exitCodes, []);
+});
+
 // ---------------------------------------------------------------------------
 // Configuration and the key
 
@@ -867,6 +1057,52 @@ test('a key written in the config is refused and never printed', async () => {
     assert.equal(t.created.length, 0);
     assert.deepEqual(t.injected, []);
   }
+});
+
+test('sync: off, no, 0 or "false" in _config.yml really switch the sync off', async () => {
+  for (const value of ['off', 'no', 0, 'false']) {
+    const t = setup({ config: momobird({ sync: value }) });
+
+    await t.build();
+
+    assert.deepEqual(t.client.calls, ['status'], JSON.stringify(value));
+    assert.deepEqual(t.messages('warn'), [], JSON.stringify(value));
+  }
+});
+
+test('momobird: false switches the plugin off: no request, no markup, no line in the log', async () => {
+  for (const value of [false, 'no', 'off', 0]) {
+    const t = setup({ config: { momobird: value } });
+
+    await t.build();
+    const locals = await t.run('template_locals', { page: postPage('a') });
+
+    assert.equal(t.created.length, 0, JSON.stringify(value));
+    assert.deepEqual(t.client.calls, [], JSON.stringify(value));
+    assert.deepEqual(t.injected, [], JSON.stringify(value));
+    assert.deepEqual(t.logs, [], JSON.stringify(value));
+    assert.equal(locals.page.content, '<p>Body of a.</p>');
+  }
+});
+
+test('an option value that is not understood is warned about once and the default applies', async () => {
+  const t = setup({ config: momobird({ widget: 'maybe' }) });
+
+  await t.build();
+  assert.equal(t.client.upserted.length, 2, 'the rest of the config still works');
+  await t.build();
+
+  const warnings = t.messages('warn');
+  assert.equal(warnings.length, 1, warnings.join('\n'));
+  assert.ok(warnings[0].startsWith('[MomoBird] '), warnings[0]);
+  assert.ok(warnings[0].includes('momobird.widget') && warnings[0].includes('maybe'), warnings[0]);
+  assert.ok(!t.injected.some((entry) => entry.to === 'default'), 'widget stays at its default, off');
+});
+
+test('strict: yes also makes a config error fail the build', async () => {
+  const t = setup({ config: momobird({ strict: 'yes', key: 'x' }) });
+
+  await assert.rejects(t.run('before_generate'), /MOMOBIRD_KEY/);
 });
 
 test('a config error rejects when strict, with the same text and no key', async () => {
@@ -1019,6 +1255,7 @@ test('hexo momobird status warns about a source of another kind but works', asyn
 
   assert.equal(t.messages('warn').length, 1);
   assert.ok(t.messages('warn')[0].includes('wordpress'));
+  assert.ok(t.messages('warn')[0].includes('除非加 --prune'), t.messages('warn')[0]);
   assert.deepEqual(t.exitCodes, []);
 });
 
@@ -1075,6 +1312,44 @@ test('hexo momobird sync --dry-run lists the plan and sends nothing', async () =
   assert.ok(!fs.existsSync(cachePath(t.hexo.base_dir, SOURCE_ID)));
 });
 
+test('hexo momobird sync --dry-run names each post it would take down and why', async () => {
+  const kept = [
+    makePost('hidden', { hidden: true }),
+    makePost('unpublished', { published: false }),
+    makePost('locked', { password: 'secret' }),
+    makePost('optout', { momobird: false }),
+    makePost('later', { date: new Date('2026-12-01T00:00:00Z') }),
+    makePost('empty', { content: '' })
+  ];
+  const t = commandSetup({
+    config: Object.assign({ future: false }, momobird({})),
+    posts: [makePost('a'), makePost('b')].concat(kept),
+    client: {
+      remote: kept.map((post) => externalId(post.source)).concat(['5550001', '5550002', '5550003']),
+      listed: {
+        5550001: { title: '旧文章', url: 'https://blog.example.com/old/' },
+        5550002: { title: '没有链接的旧文章' }
+      }
+    }
+  });
+
+  await t.command({ _: ['sync'], 'dry-run': true });
+
+  const removals = t.messages('info').filter((line) => line.includes('将下线：'));
+  assert.deepEqual(removals, [
+    '[MomoBird] 将下线：_posts/hidden.md（隐藏）',
+    '[MomoBird] 将下线：_posts/unpublished.md（未发布）',
+    '[MomoBird] 将下线：_posts/locked.md（加密）',
+    '[MomoBird] 将下线：_posts/optout.md（momobird: false）',
+    '[MomoBird] 将下线：_posts/later.md（未到发布时间）',
+    '[MomoBird] 将下线：_posts/empty.md（正文为空）',
+    '[MomoBird] 将下线：旧文章（https://blog.example.com/old/）',
+    '[MomoBird] 将下线：没有链接的旧文章',
+    '[MomoBird] 将下线：编号 5550003（本地找不到对应文件）'
+  ]);
+  assert.ok(!t.client.calls.includes('delete'));
+});
+
 test('hexo momobird sync --prune passes the flag through, and without it the guard holds', async () => {
   const remote = [];
   for (let i = 1; i <= 12; i += 1) remote.push('9000' + i);
@@ -1089,6 +1364,57 @@ test('hexo momobird sync --prune passes the flag through, and without it the gua
   assert.equal(pruned.client.deleted.length, 12);
   assert.ok(pruned.text().includes('下线 12 篇'));
   assert.deepEqual(pruned.exitCodes, []);
+});
+
+function twelveRemoteIds() {
+  const remote = [];
+  for (let i = 1; i <= 12; i += 1) remote.push('9000' + i);
+  return remote;
+}
+
+// hexo-cli parses the command line with minimist: `--prune` is true,
+// `--prune=` is '', `--prune true` is 'true', `--prune=no` and `--prune no`
+// are 'no', `--prune=0` is 0 and `--no-prune` is false. Only the first three
+// switch a flag on; anything else is a usage error, so a typed "no" can never
+// mean "remove without the guard", nor silently mean nothing.
+test('hexo momobird sync accepts --prune and --dry-run only as true, "" or "true"', async () => {
+  for (const value of [true, '', 'true']) {
+    const pruned = commandSetup({ client: { remote: twelveRemoteIds() } });
+    await pruned.command({ _: ['sync'], prune: value });
+    assert.equal(pruned.client.deleted.length, 12, 'prune ' + JSON.stringify(value));
+    assert.deepEqual(pruned.exitCodes, [], 'prune ' + JSON.stringify(value));
+
+    for (const name of ['dry-run', 'dry_run', 'dryRun']) {
+      const dry = commandSetup({ client: { remote: ['90001'] } });
+      await dry.command({ _: ['sync'], [name]: value });
+      assert.deepEqual(dry.client.calls, ['status', 'list'], name + ' ' + JSON.stringify(value));
+      assert.deepEqual(dry.exitCodes, [], name + ' ' + JSON.stringify(value));
+    }
+  }
+});
+
+test('any other --prune or --dry-run value is a usage error: exit 1, nothing loaded or sent', async () => {
+  const spellings = [];
+  for (const value of ['no', 'off', 'false', 'NO', false, 0, '0', 'yes', 1, 'maybe', null, [true, true]]) {
+    spellings.push({ prune: value });
+    spellings.push({ 'dry-run': value });
+  }
+  spellings.push({ dry_run: 'false' }, { dryRun: 'no' }, { 'dry-run': true, prune: 'no' }, { 'dry-run': 'no', prune: true });
+
+  for (const flags of spellings) {
+    const label = JSON.stringify(flags);
+    const t = commandSetup({ client: { remote: twelveRemoteIds() } });
+
+    await t.command(Object.assign({ _: ['sync'] }, flags));
+
+    assert.deepEqual(t.exitCodes, [1], label);
+    assert.equal(t.loads.length, 0, label);
+    assert.deepEqual(t.client.calls, [], label);
+    const errors = t.messages('error');
+    assert.equal(errors.length, 1, label);
+    assert.ok(errors[0].includes('用法：hexo momobird <status|sync> [--dry-run] [--prune]'), errors[0]);
+    assert.ok(errors[0].includes(Object.prototype.hasOwnProperty.call(flags, 'prune') && flags.prune !== true ? '--prune' : '--dry-run'), errors[0]);
+  }
 });
 
 test('hexo momobird sync exits non-zero on a fatal sync error', async () => {
